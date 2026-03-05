@@ -68,6 +68,11 @@ public abstract class PipeEndpoint : IDisposable
         Send(MessageType.UIFreeze, b => b.Write(durationInMs));
     }
 
+    public void SendTypingLatency(long latencyUs)
+    {
+        Send(MessageType.TypingLatency, b => b.Write(latencyUs));
+    }
+
     public void Dispose()
     {
         var pipe = _pipe;

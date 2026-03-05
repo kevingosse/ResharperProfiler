@@ -15,6 +15,7 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
 {
     private Client? _pipeClient;
     private uint _mainThreadId;
+    private readonly ManualResetEventSlim _solutionLoadMutex = new(false);
     private readonly ManualResetEventSlim _responsiveMutex = new(false);
     private readonly CancellationTokenSource _solutionLoaded = new();
     private long _sentInput;
@@ -87,9 +88,19 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
 
         var fileName = Path.GetFileNameWithoutExtension(moduleInfo.ModuleName);
 
+        if (fileName.StartsWith("JetBrains", StringComparison.OrdinalIgnoreCase))
+        {
+            Log.Write($"Module loaded: {fileName} (id: {moduleId.Value:x2})");
+        }
+
         if ("JetBrains.ReSharper.Feature.Services".Equals(fileName, StringComparison.OrdinalIgnoreCase))
         {
-            return HookSolutionLoad(moduleId);
+            Log.Write($"ProjectModel module loaded (id: {moduleId.Value:x2}), hooking solution load");
+            var result = HookSolutionLoad(moduleId);
+
+            _solutionLoadMutex.Set();
+
+            return result;
         }
 
         return HResult.S_OK;
@@ -284,6 +295,10 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
 
     private void InputThread()
     {
+        // Wait until Resharper modules are loaded before sending the fake inputs
+        // Old versions of Resharper don't start loading until VS is idle, so sending inputs keeps them waiting forever
+        _solutionLoadMutex.Wait();
+
         SetHook((int)_mainThreadId);
 
         try
@@ -364,7 +379,9 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
         {
             if (code >= 0)
             {
-                if ((int)wParam == 0xFC)
+                var isProbeKey = (int)wParam == 0xFC;
+
+                if (isProbeKey)
                 {
                     _receivedInput++;
                 }
@@ -377,6 +394,13 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
                 if (_keyTimestamps.TryDequeue(out var llTimestamp))
                 {
                     _responsiveMutex.Set();
+
+                    // Report typing latency for real key-down events after solution is loaded
+                    if (!isProbeKey && _solutionLoaded.IsCancellationRequested && (int)lParam >= 0)
+                    {
+                        var latencyUs = (long)Stopwatch.GetElapsedTime(llTimestamp).TotalMicroseconds;
+                        _pipeClient?.SendTypingLatency(latencyUs);
+                    }
                 }
             }
 
