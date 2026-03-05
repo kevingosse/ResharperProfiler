@@ -129,7 +129,6 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
             return;
         }
 
-        Log.Write("Solution loaded");
         _pipeClient?.SendSolutionLoaded();
         _solutionLoaded.Cancel();
         Log.Write($"Total input events sent: {_sentInput}, received: {_receivedInput}");
@@ -160,8 +159,6 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
 
     private HResult HookSolutionLoad(ModuleId projectModelModuleId)
     {
-        Log.Write("Hooking solution load");
-
         try
         {
             using var metadataImport = ICorProfilerInfo.GetModuleMetaDataImport2(projectModelModuleId, CorOpenFlags.ofRead)
@@ -202,8 +199,6 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
                     continue;
                 }
 
-                Log.Write($"Hooking {typeName}.{methodName}");
-
                 var ilRewriter = Silhouette.IL.IlRewriter.Create(ICorProfilerInfo3);
                 using var method = ilRewriter.Import(projectModelModuleId, methodDef);
 
@@ -220,7 +215,7 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
 
                 ilRewriter.Export(method);
 
-                Log.Write($"Successfully hooked {typeName}.{methodName}");
+                _pipeClient?.SendSolutionListenerReady();
 
                 return HResult.S_OK;
             }
@@ -352,8 +347,6 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
             Log.Write($"Failed to install WH_KEYBOARD_LL hook: {Marshal.GetLastWin32Error()}");
             return;
         }
-
-        Log.Write("WH_KEYBOARD_LL hook installed");
 
         // Message pump to keep the LL hook alive
         while (NativeMethods.GetMessage(out var msg, IntPtr.Zero, 0, 0) > 0)

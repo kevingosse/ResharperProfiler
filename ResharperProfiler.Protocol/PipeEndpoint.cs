@@ -57,6 +57,12 @@ public abstract class PipeEndpoint : IDisposable
         Send(MessageType.SolutionLoaded);
     }
 
+    public void SendSolutionListenerReady()
+    {
+        Send(MessageType.SolutionListenerReady);
+    }
+
+
     public void SendUIFreeze(long durationInMs)
     {
         Send(MessageType.UIFreeze, b => b.Write(durationInMs));

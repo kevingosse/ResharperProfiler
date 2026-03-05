@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Text;
 using ResharperProfiler.Protocol;
+using Spectre.Console;
 
 namespace ResharperProfiler.ConsoleLauncher;
 
@@ -10,6 +11,9 @@ static class Program
     private static long _totalFreezeTime;
     private static long _maxFreezeTime;
     private static long _startupTime;
+
+    private static readonly ManualResetEventSlim _solutionListenerReady = new();
+    private static readonly ManualResetEventSlim _solutionLoaded = new();
 
     static int Main(string[] args)
     {
@@ -77,67 +81,101 @@ static class Program
 
         _startupTime = Environment.TickCount64;
 
-        Console.WriteLine($"Started process {process.Id}, waiting for profiler to connect...");
+        return AnsiConsole.Status()
+            .Spinner(Spinner.Known.Dots)
+            .Start("Starting...", ctx =>
+            {
+                WriteStep($"Process [bold]{process.Id}[/] started");
 
-        // Wait for the profiler to connect (or the process to exit first)
-        while (!serverReady.Wait(1000))
+                // Wait for the profiler to connect (or the process to exit first)
+                ctx.Status("Waiting for profiler to connect...");
+                while (!serverReady.Wait(1000))
+                {
+                    if (process.HasExited)
+                    {
+                        Console.Error.WriteLine($"Process exited ({process.ExitCode}) before profiler connected.");
+                        return process.ExitCode;
+                    }
+                }
+
+                if (serverError is not null)
+                {
+                    Console.Error.WriteLine($"Pipe server error: {serverError.Message}");
+                    process.Kill();
+                    return 1;
+                }
+
+                WriteStep("Profiler connected");
+
+                // Wait for solution listener
+                ctx.Status("Waiting for solution listener...");
+                WaitForAny(_solutionListenerReady, process);
+                if (_solutionListenerReady.IsSet)
+                    WriteStep("Solution listener ready");
+
+                // Wait for solution to load
+                ctx.Status("Waiting for solution to load...");
+                WaitForAny(_solutionLoaded, process);
+                if (_solutionLoaded.IsSet)
+                {
+                    var totalTime = Environment.TickCount64 - _startupTime;
+                    WriteStep($"Solution loaded [dim]({totalTime / 1000.0:F1}s total)[/]");
+                    AnsiConsole.MarkupLine(
+                        $"           Total UI freeze: [bold]{_totalFreezeTime}[/] ms (max: [bold]{_maxFreezeTime}[/] ms)");
+                }
+
+                ctx.Status("Running...");
+                process.WaitForExit();
+                server!.Dispose();
+
+                return process.ExitCode;
+            });
+    }
+
+    static void WriteStep(string message)
+    {
+        var elapsed = (Environment.TickCount64 - _startupTime) / 1000.0;
+        AnsiConsole.MarkupLine($"  [dim]{elapsed,6:F1}s[/]  [green]✓[/] {message}");
+    }
+
+    static void WaitForAny(ManualResetEventSlim signal, Process process)
+    {
+        while (!signal.Wait(1000))
         {
             if (process.HasExited)
-            {
-                Console.Error.WriteLine($"Process exited ({process.ExitCode}) before profiler connected.");
-                return process.ExitCode;
-            }
+                return;
         }
-
-        if (serverError is not null)
-        {
-            Console.Error.WriteLine($"Pipe server error: {serverError.Message}");
-            process.Kill();
-            return 1;
-        }
-
-        Console.WriteLine("Profiler connected.");
-
-        process.WaitForExit();
-        server!.Dispose();
-
-        return process.ExitCode;
     }
+
     static void OnMessageReceived(long timestamp, MessageType type, byte[] payload)
     {
         switch (type)
         {
             case MessageType.Log:
-            {
-                using var reader = new BinaryReader(new MemoryStream(payload), Encoding.UTF8);
-                Console.WriteLine($"[{timestamp}] LOG: {reader.ReadString()}");
                 break;
-            }
+
+            case MessageType.SolutionListenerReady:
+                _solutionListenerReady.Set();
+                break;
 
             case MessageType.SolutionLoaded:
-                var loadTime = Environment.TickCount64 - _startupTime;
-
-                Console.WriteLine($"[{timestamp}] Solution loaded after {loadTime/1000.0} seconds");
-                Console.WriteLine($"Total UI freeze time: {_totalFreezeTime} ms (max: {_maxFreezeTime} ms)");
+                _solutionLoaded.Set();
                 break;
 
             case MessageType.UIFreeze:
             {
                 using var reader = new BinaryReader(new MemoryStream(payload));
                 var duration = reader.ReadInt64();
-                Console.WriteLine($"[{timestamp}] UI freeze: {duration} ms");
                 _totalFreezeTime += duration;
 
                 if (duration > _maxFreezeTime)
-                {
                     _maxFreezeTime = duration;
-                }
 
                 break;
             }
 
             default:
-                Console.WriteLine($"[{timestamp}] Unknown({type})");
+                AnsiConsole.MarkupLine($"  [dim]Unknown({type})[/]");
                 break;
         }
     }
