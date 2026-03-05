@@ -1,0 +1,10 @@
+<Solution>
+  <Folder Name="/Solution Items/">
+    <File Path="Build.ps1" />
+    <File Path="EnableProfiler.ps1" />
+    <File Path="Launch.ps1" />
+  </Folder>
+  <Project Path="ResharperProfiler.ConsoleLauncher/ResharperProfiler.ConsoleLauncher.csproj" Id="a57e95fa-c6b4-4465-b306-65dc42aede0a" />
+  <Project Path="ResharperProfiler.Protocol/ResharperProfiler.Protocol.csproj" Id="011dbe60-f8fc-408a-abea-02c33a38437f" />
+  <Project Path="ResharperProfiler/ResharperProfiler.csproj" />
+</Solution>
