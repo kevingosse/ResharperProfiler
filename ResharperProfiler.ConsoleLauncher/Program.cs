@@ -136,6 +136,9 @@ static class Program
 
         // Startup phase
         var startupOk = true;
+        var ungracefulExit = false;
+        long totalTime = 0;
+        long closeTime = 0;
 
         AnsiConsole.Status()
             .Spinner(Spinner.Known.Dots)
@@ -171,36 +174,45 @@ static class Program
 
                 ctx.Status("Waiting for solution to load...");
                 WaitForAny(SolutionLoaded, process);
+
+                if (!SolutionLoaded.IsSet)
+                {
+                    startupOk = false;
+                    return;
+                }
+
+                totalTime = Environment.TickCount64 - _startupTime;
+                AnsiConsole.MarkupLine(
+                    $"  [dim]{totalTime / 1000.0,6:F1}s[/]  [green]✓[/] Solution loaded [dim]({totalTime / 1000.0:F1}s total)[/]\n" +
+                    $"           Total UI freeze: [bold]{_totalFreezeTime}[/] ms (max: [bold]{_maxFreezeTime}[/] ms)");
+
+                var closeStartTime = Environment.TickCount64;
+                ctx.Status("Waiting for process to exit...");
+                CloseProcessWindows(process.Id);
+
+                if (!process.WaitForExit(60_000))
+                {
+                    AnsiConsole.MarkupLine("  [yellow]⚠[/] VS did not exit gracefully, killing...");
+                    process.Kill();
+                    process.WaitForExit();
+                    ungracefulExit = true;
+                }
+
+                closeTime = Environment.TickCount64 - closeStartTime;
+                AnsiConsole.MarkupLine($"  [dim]{(Environment.TickCount64 - _startupTime) / 1000.0:F1}s[/]  [green]✓[/] Process exited in {closeTime / 1000.0,6:F1}s with code {process.ExitCode}");
             });
 
-        if (!startupOk || process.HasExited)
+        if (!startupOk)
         {
             server?.Dispose();
             return process.HasExited ? process.ExitCode : 1;
         }
 
-        var totalTime = Environment.TickCount64 - _startupTime;
-        var elapsed = (Environment.TickCount64 - _startupTime) / 1000.0;
-        var solutionSummary = $"  [dim]{elapsed,6:F1}s[/]  [green]✓[/] Solution loaded [dim]({totalTime / 1000.0:F1}s total)[/]\n" +
-                              $"           Total UI freeze: [bold]{_totalFreezeTime}[/] ms (max: [bold]{_maxFreezeTime}[/] ms)";
-
-
-        AnsiConsole.MarkupLine(solutionSummary);
-
-        var closeStartTime = Environment.TickCount64;
-
-        CloseProcessWindows(process.Id);
-
-        if (!process.WaitForExit(60_000))
+        if (ungracefulExit)
         {
-            AnsiConsole.MarkupLine("  [yellow]⚠[/] VS did not exit gracefully, killing...");
-            process.Kill();
-            process.WaitForExit();
+            server?.Dispose();
             return 1;
         }
-
-        var closeTime = Environment.TickCount64 - closeStartTime;
-        AnsiConsole.MarkupLine($"  [dim]{(Environment.TickCount64 - _startupTime) / 1000.0:F1}s[/]  [green]✓[/] Process exited in {closeTime / 1000.0,6:F1}s with code {process.ExitCode}");
 
         if (outputPath is not null)
         {
