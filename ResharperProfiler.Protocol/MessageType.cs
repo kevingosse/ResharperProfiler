@@ -8,8 +8,7 @@ namespace ResharperProfiler.Protocol;
 public enum MessageType : byte
 {
     Log = 1,
-    SolutionLoaded = 2,
+    Phase = 2,
     UIFreeze = 3,
-    SolutionListenerReady = 4,
     TypingLatency = 5
 }

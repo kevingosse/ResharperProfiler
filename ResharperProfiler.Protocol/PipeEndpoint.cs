@@ -52,14 +52,9 @@ public abstract class PipeEndpoint : IDisposable
         Send(MessageType.Log, w => w.Write(message));
     }
 
-    public void SendSolutionLoaded()
+    public void ReportPhase(Phase phase)
     {
-        Send(MessageType.SolutionLoaded);
-    }
-
-    public void SendSolutionListenerReady()
-    {
-        Send(MessageType.SolutionListenerReady);
+        Send(MessageType.Phase, w => w.Write((byte)phase));
     }
 
 

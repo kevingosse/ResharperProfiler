@@ -16,27 +16,11 @@ static class Program
     private static long _startupTime;
     private static bool _debug;
 
-    private static readonly ManualResetEventSlim _solutionListenerReady = new();
-    private static readonly ManualResetEventSlim _solutionLoaded = new();
+    private static readonly ManualResetEventSlim SolutionListenerReady = new();
+    private static readonly ManualResetEventSlim SolutionLoaded = new();
 
-    private static readonly object _latencyLock = new();
-    private static readonly List<double> _latencies = new(); // in ms
-
-    /// <summary>
-    /// Plop will call <see cref="AnotherMethod"/>
-    /// </summary>
-    private static void Plop()
-    {
-
-    }
-
-    /// <summary>
-    /// A description about the method
-    /// </summary>
-    private static void AnotherMethod()
-    {
-
-    }
+    private static readonly Lock LatencyLock = new();
+    private static readonly List<double> Latencies = new(); // in ms
 
     static int Main(string[] args)
     {
@@ -84,7 +68,11 @@ static class Program
                 server = new Server(pipeName);
                 server.MessageReceived += OnMessageReceived;
                 server.Error += (context, ex) => Console.Error.WriteLine($"[PIPE ERROR] {context}: {ex}");
-                server.Disconnected += () => Console.Error.WriteLine("[PIPE] Disconnected");
+                server.Disconnected += () =>
+                {
+                    if (_debug || !SolutionLoaded.IsSet)
+                        Console.Error.WriteLine("[PIPE] Disconnected");
+                };
                 server.Start();
             }
             catch (Exception ex)
@@ -177,12 +165,12 @@ static class Program
                 WriteStep("Profiler connected");
 
                 ctx.Status("Waiting for solution listener...");
-                WaitForAny(_solutionListenerReady, process);
-                if (_solutionListenerReady.IsSet)
+                WaitForAny(SolutionListenerReady, process);
+                if (SolutionListenerReady.IsSet)
                     WriteStep("Solution listener ready");
 
                 ctx.Status("Waiting for solution to load...");
-                WaitForAny(_solutionLoaded, process);
+                WaitForAny(SolutionLoaded, process);
             });
 
         if (!startupOk || process.HasExited)
@@ -275,15 +263,15 @@ static class Program
         rows.Add(new Markup("  [bold]Typing Latency Test[/] - type in the editor"));
         rows.Add(new Text(""));
 
-        lock (_latencyLock)
+        lock (LatencyLock)
         {
-            if (_latencies.Count == 0)
+            if (Latencies.Count == 0)
             {
                 rows.Add(new Markup("  [dim]Waiting for keystrokes...[/]"));
             }
             else
             {
-                var sorted = _latencies.OrderBy(x => x).ToList();
+                var sorted = Latencies.OrderBy(x => x).ToList();
                 var count = sorted.Count;
                 var avg = sorted.Average();
                 var median = Percentile(sorted, 50);
@@ -370,17 +358,22 @@ static class Program
                 break;
             }
 
-            case MessageType.SolutionListenerReady:
+            case MessageType.Phase:
+            {
+                var phase = (Phase)payload[0];
                 if (_debug)
-                    Console.WriteLine($"[{timestamp}] Solution listener ready");
-                _solutionListenerReady.Set();
+                    Console.WriteLine($"[{timestamp}] Phase: {phase}");
+                switch (phase)
+                {
+                    case Phase.SolutionListenerReady:
+                        SolutionListenerReady.Set();
+                        break;
+                    case Phase.SaveCaches:
+                        SolutionLoaded.Set();
+                        break;
+                }
                 break;
-
-            case MessageType.SolutionLoaded:
-                if (_debug)
-                    Console.WriteLine($"[{timestamp}] Solution loaded");
-                _solutionLoaded.Set();
-                break;
+            }
 
             case MessageType.UIFreeze:
             {
@@ -405,9 +398,9 @@ static class Program
                 if (_debug)
                     Console.WriteLine($"[{timestamp}] Typing latency: {latencyUs / 1000.0:F1} ms");
 
-                lock (_latencyLock)
+                lock (LatencyLock)
                 {
-                    _latencies.Add(latencyUs / 1000.0);
+                    Latencies.Add(latencyUs / 1000.0);
                 }
 
                 break;

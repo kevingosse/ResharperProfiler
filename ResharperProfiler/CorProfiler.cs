@@ -97,13 +97,12 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
         {
             Log.Write($"Feature services module loaded (id: {moduleId.Value:x2}), hooking daemon ready");
 
-            var result = HookMethod(moduleId, "JetBrains.ReSharper.Feature.Services.Daemon.DaemonPerformanceCollector", "RegisterDaemonFinished", &OnSolutionLoadedCallback, instrumentMethodStart: true);
+            var result = HookMethod(moduleId, "JetBrains.ReSharper.Feature.Services.Daemon.DaemonPerformanceCollector", "RegisterDaemonFinished", &OnDaemonFinishedCallback, instrumentMethodStart: true);
 
             if (!result)
             {
                 Log.Write($"Failed to hook daemon ready: {result}");
             }
-
 
             _solutionLoadMutex.Set();
 
@@ -113,12 +112,14 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
         if ("JetBrains.ReSharper.Psi".Equals(fileName, StringComparison.OrdinalIgnoreCase))
         {
             Log.Write($"ProjectModel module loaded (id: {moduleId.Value:x2}), hooking report phase");
-            var result = HookMethod(moduleId, "JetBrains.ReSharper.Psi.Caches.Jobs.JobSaveCaches", "Do", &OnReportPhaseCallback, instrumentMethodStart: false);
+            var result = HookMethod(moduleId, "JetBrains.ReSharper.Psi.Caches.Jobs.JobSaveCaches", "Do", &OnSaveCachesCallback, instrumentMethodStart: false);
 
             if (!result)
             {
                 Log.Write($"Failed to hook save caches: {result}");
             }
+
+            _pipeClient?.ReportPhase(Phase.SolutionListenerReady);
 
             return result;
         }
@@ -127,7 +128,7 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
     }
 
     [UnmanagedCallersOnly]
-    private static void OnReportPhaseCallback(IntPtr instance)
+    private static void OnSaveCachesCallback(IntPtr instance)
     {
         try
         {
@@ -135,7 +136,7 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
 
             if (target is CorProfiler profiler)
             {
-                profiler.OnReportPhase();
+                profiler.OnSaveCaches();
             }
             else
             {
@@ -148,14 +149,17 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
         }
     }
 
-    private void OnReportPhase()
+    private void OnSaveCaches()
     {
-        Log.Write($"Report phase");
+        _pipeClient?.ReportPhase(Phase.SaveCaches);
+
+        _solutionLoaded.Cancel();
+        Log.Write($"Total input events sent: {_sentInput}, received: {_receivedInput}");
     }
 
 
     [UnmanagedCallersOnly]
-    private static void OnSolutionLoadedCallback(IntPtr instance)
+    private static void OnDaemonFinishedCallback(IntPtr instance)
     {
         try
         {
@@ -163,7 +167,7 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
 
             if (target is CorProfiler profiler)
             {
-                profiler.OnSolutionLoaded();
+                profiler.OnDaemonFinished();
             }
             else
             {
@@ -176,16 +180,14 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
         }
     }
 
-    private void OnSolutionLoaded()
+    private void OnDaemonFinished()
     {
         if (_solutionLoaded.IsCancellationRequested)
         {
             return;
         }
 
-        _pipeClient?.SendSolutionLoaded();
-        _solutionLoaded.Cancel();
-        Log.Write($"Total input events sent: {_sentInput}, received: {_receivedInput}");
+        _pipeClient?.ReportPhase(Phase.DaemonFinished);        
     }
 
     private static Client? CreatePipeClient()
@@ -236,7 +238,7 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
         var ilRewriter = Silhouette.IL.IlRewriter.Create(ICorProfilerInfo3);
         using var method = ilRewriter.Import(moduleId, methodDef);
 
-        var ptr = (nint)(delegate* unmanaged<IntPtr, void>)&OnReportPhaseCallback;
+        var ptr = (nint)(delegate* unmanaged<IntPtr, void>)&OnSaveCachesCallback;
 
         var sig = MethodSig.CreateStatic(method.Metadata.CorLibTypes.Void, method.Metadata.CorLibTypes.IntPtr);
         sig.CallingConvention = dnlib.DotNet.CallingConvention.Unmanaged;
