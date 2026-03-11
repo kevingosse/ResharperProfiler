@@ -90,15 +90,35 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
 
         if (fileName.StartsWith("JetBrains", StringComparison.OrdinalIgnoreCase))
         {
-            Log.Write($"Module loaded: {fileName} (id: {moduleId.Value:x2})");
+            //Log.Write($"Module loaded: {fileName} (id: {moduleId.Value:x2})");
         }
 
         if ("JetBrains.ReSharper.Feature.Services".Equals(fileName, StringComparison.OrdinalIgnoreCase))
         {
-            Log.Write($"ProjectModel module loaded (id: {moduleId.Value:x2}), hooking solution load");
-            var result = HookSolutionLoad(moduleId);
+            Log.Write($"Feature services module loaded (id: {moduleId.Value:x2}), hooking daemon ready");
+
+            var result = HookMethod(moduleId, "JetBrains.ReSharper.Feature.Services.Daemon.DaemonPerformanceCollector", "RegisterDaemonFinished", &OnSolutionLoadedCallback, instrumentMethodStart: true);
+
+            if (!result)
+            {
+                Log.Write($"Failed to hook daemon ready: {result}");
+            }
+
 
             _solutionLoadMutex.Set();
+
+            return result;
+        }
+
+        if ("JetBrains.ReSharper.Psi".Equals(fileName, StringComparison.OrdinalIgnoreCase))
+        {
+            Log.Write($"ProjectModel module loaded (id: {moduleId.Value:x2}), hooking report phase");
+            var result = HookMethod(moduleId, "JetBrains.ReSharper.Psi.Caches.Jobs.JobSaveCaches", "Do", &OnReportPhaseCallback, instrumentMethodStart: false);
+
+            if (!result)
+            {
+                Log.Write($"Failed to hook save caches: {result}");
+            }
 
             return result;
         }
@@ -106,10 +126,33 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
         return HResult.S_OK;
     }
 
-    private static IEnumerable<(string TypeName, string? ParentTypeName, string MethodName)> GetSolutionDoneCandidates()
+    [UnmanagedCallersOnly]
+    private static void OnReportPhaseCallback(IntPtr instance)
     {
-        yield return ("JetBrains.ReSharper.Feature.Services.Daemon.DaemonPerformanceCollector", null, "RegisterDaemonFinished");
+        try
+        {
+            var target = GCHandle.FromIntPtr(instance).Target;
+
+            if (target is CorProfiler profiler)
+            {
+                profiler.OnReportPhase();
+            }
+            else
+            {
+                Log.Write($"Failed to get CorProfiler instance from callback (ptr: {instance:x2})");
+            }
+        }
+        catch (InvalidOperationException ex)
+        {
+            Log.Write($"Failed to get CorProfiler instance from callback (ptr: {instance:x2}): {ex}");
+        }
     }
+
+    private void OnReportPhase()
+    {
+        Log.Write($"Report phase");
+    }
+
 
     [UnmanagedCallersOnly]
     private static void OnSolutionLoadedCallback(IntPtr instance)
@@ -168,82 +211,48 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
         }
     }
 
-    private HResult HookSolutionLoad(ModuleId projectModelModuleId)
+    private HResult HookMethod(ModuleId moduleId, string typeName, string methodName, delegate* unmanaged<IntPtr, void> callback, bool instrumentMethodStart)
     {
-        try
+        using var metadataImport = ICorProfilerInfo.GetModuleMetaDataImport2(moduleId, CorOpenFlags.ofRead)
+            .ThrowIfFailed()
+            .Wrap();
+
+        var (result, typeDef) = metadataImport.Value.FindTypeDefByName(typeName, default);
+
+        if (!result)
         {
-            using var metadataImport = ICorProfilerInfo.GetModuleMetaDataImport2(projectModelModuleId, CorOpenFlags.ofRead)
-                .ThrowIfFailed()
-                .Wrap();
-
-            foreach (var (typeName, parentTypeName, methodName) in GetSolutionDoneCandidates())
-            {
-                HResult result;
-                MdToken enclosingClass = default;
-
-                if (parentTypeName != null)
-                {
-                    (result, var parentTypeDef) = metadataImport.Value.FindTypeDefByName(parentTypeName, default);
-
-                    if (!result)
-                    {
-                        Log.Write($"Failed to find parent type {parentTypeName} for candidate {typeName}.{methodName}");
-                        continue;
-                    }
-
-                    enclosingClass = new(parentTypeDef.Value);
-                }
-
-                (result, var typeDef) = metadataImport.Value.FindTypeDefByName(typeName, enclosingClass);
-
-                if (!result)
-                {
-                    Log.Write($"Failed to find type {typeName} for candidate {typeName}.{methodName}");
-                    continue;
-                }
-
-                (result, var methodDef) = metadataImport.Value.FindMethod(typeDef, methodName, default);
-
-                if (!result)
-                {
-                    Log.Write($"Failed to find method {methodName} in type {typeName} for candidate {typeName}.{methodName}");
-                    continue;
-                }
-
-                var ilRewriter = Silhouette.IL.IlRewriter.Create(ICorProfilerInfo3);
-                using var method = ilRewriter.Import(projectModelModuleId, methodDef);
-
-                var ptr = (nint)(delegate* unmanaged<IntPtr, void>)&OnSolutionLoadedCallback;
-
-                var sig = MethodSig.CreateStatic(method.Metadata.CorLibTypes.Void, method.Metadata.CorLibTypes.IntPtr);
-                sig.CallingConvention = dnlib.DotNet.CallingConvention.Unmanaged;
-
-                method.Body.Instructions.Insert(0, Instruction.Create(OpCodes.Ldc_I8, GCHandle.ToIntPtr(_thisHandle)));
-                method.Body.Instructions.Insert(1, Instruction.Create(OpCodes.Conv_I));
-                method.Body.Instructions.Insert(2, Instruction.Create(OpCodes.Ldc_I8, ptr));
-                method.Body.Instructions.Insert(3, Instruction.Create(OpCodes.Conv_I));
-                method.Body.Instructions.Insert(4, Instruction.Create(OpCodes.Calli, sig));
-
-                ilRewriter.Export(method);
-
-                _pipeClient?.SendSolutionListenerReady();
-
-                return HResult.S_OK;
-            }
-
-            Log.Write("Failed to find solution load method to hook");
+            Log.Write($"Failed to find type {typeName}");
             return HResult.E_FAIL;
         }
-        catch (Win32Exception ex)
+
+        (result, var methodDef) = metadataImport.Value.FindMethod(typeDef, methodName, default);
+
+        if (!result)
         {
-            Log.Write($"Failed to hook solution load: {ex}");
-            return ex.HResult;
-        }
-        catch (Exception ex)
-        {
-            Log.Write($"Failed to hook solution load: {ex}");
+            Log.Write($"Failed to find method {methodName} in type {typeName}");
             return HResult.E_FAIL;
         }
+
+        var ilRewriter = Silhouette.IL.IlRewriter.Create(ICorProfilerInfo3);
+        using var method = ilRewriter.Import(moduleId, methodDef);
+
+        var ptr = (nint)(delegate* unmanaged<IntPtr, void>)&OnReportPhaseCallback;
+
+        var sig = MethodSig.CreateStatic(method.Metadata.CorLibTypes.Void, method.Metadata.CorLibTypes.IntPtr);
+        sig.CallingConvention = dnlib.DotNet.CallingConvention.Unmanaged;
+
+        int index = 0;
+        int InstructionIndex() => instrumentMethodStart ? index++ : method.Body.Instructions.Count - 1;
+
+        method.Body.Instructions.Insert(InstructionIndex(), Instruction.Create(OpCodes.Ldc_I8, GCHandle.ToIntPtr(_thisHandle)));
+        method.Body.Instructions.Insert(InstructionIndex(), Instruction.Create(OpCodes.Conv_I));
+        method.Body.Instructions.Insert(InstructionIndex(), Instruction.Create(OpCodes.Ldc_I8, ptr));
+        method.Body.Instructions.Insert(InstructionIndex(), Instruction.Create(OpCodes.Conv_I));
+        method.Body.Instructions.Insert(InstructionIndex(), Instruction.Create(OpCodes.Calli, sig));
+
+        ilRewriter.Export(method);
+
+        return HResult.S_OK;
     }
 
     private void MonitoringThread()

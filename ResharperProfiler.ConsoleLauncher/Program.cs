@@ -1,5 +1,7 @@
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.Json;
 using ResharperProfiler.Protocol;
 using Spectre.Console;
 using Spectre.Console.Rendering;
@@ -20,17 +22,42 @@ static class Program
     private static readonly object _latencyLock = new();
     private static readonly List<double> _latencies = new(); // in ms
 
+    /// <summary>
+    /// Plop will call <see cref="AnotherMethod"/>
+    /// </summary>
+    private static void Plop()
+    {
+
+    }
+
+    /// <summary>
+    /// A description about the method
+    /// </summary>
+    private static void AnotherMethod()
+    {
+
+    }
+
     static int Main(string[] args)
     {
+        string? outputPath = null;
+
         if (args is ["--debug", .. var rest])
         {
             _debug = true;
             args = rest;
         }
 
+        if (args is ["--output", var path, .. var rest2])
+        {
+            
+            outputPath = path;
+            args = rest2;
+        }
+
         if (args.Length == 0)
         {
-            Console.Error.WriteLine("Usage: ResharperProfiler.ConsoleLauncher [--debug] <executable> [args...]");
+            Console.Error.WriteLine("Usage: ResharperProfiler.ConsoleLauncher [--debug] [--output <path>] <executable> [args...]");
             return 1;
         }
 
@@ -164,32 +191,57 @@ static class Program
             return process.HasExited ? process.ExitCode : 1;
         }
 
-        string? solutionSummary = null;
+        var totalTime = Environment.TickCount64 - _startupTime;
+        var elapsed = (Environment.TickCount64 - _startupTime) / 1000.0;
+        var solutionSummary = $"  [dim]{elapsed,6:F1}s[/]  [green]✓[/] Solution loaded [dim]({totalTime / 1000.0:F1}s total)[/]\n" +
+                              $"           Total UI freeze: [bold]{_totalFreezeTime}[/] ms (max: [bold]{_maxFreezeTime}[/] ms)";
 
-        if (_solutionLoaded.IsSet)
+
+        AnsiConsole.MarkupLine(solutionSummary);
+
+        var closeStartTime = Environment.TickCount64;
+
+        CloseProcessWindows(process.Id);
+
+        if (!process.WaitForExit(60_000))
         {
-            var totalTime = Environment.TickCount64 - _startupTime;
-            var elapsed = (Environment.TickCount64 - _startupTime) / 1000.0;
-            solutionSummary =
-                $"  [dim]{elapsed,6:F1}s[/]  [green]✓[/] Solution loaded [dim]({totalTime / 1000.0:F1}s total)[/]\n" +
-                $"           Total UI freeze: [bold]{_totalFreezeTime}[/] ms (max: [bold]{_maxFreezeTime}[/] ms)";
+            AnsiConsole.MarkupLine("  [yellow]⚠[/] VS did not exit gracefully, killing...");
+            process.Kill();
+            process.WaitForExit();
+            return 1;
         }
 
-        // Typing latency phase
-        IRenderable BuildDisplay() => BuildLatencyDisplay(solutionSummary);
+        var closeTime = Environment.TickCount64 - closeStartTime;
+        AnsiConsole.MarkupLine($"  [dim]{(Environment.TickCount64 - _startupTime) / 1000.0:F1}s[/]  [green]✓[/] Process exited in {closeTime / 1000.0,6:F1}s with code {process.ExitCode}");
 
-        AnsiConsole.Live(BuildDisplay())
-            .AutoClear(false)
-            .Start(ctx =>
+        if (outputPath is not null)
+        {
+            var results = new Dictionary<string, long>
             {
-                while (!process.HasExited)
-                {
-                    Thread.Sleep(200);
-                    ctx.UpdateTarget(BuildDisplay());
-                }
+                ["solutionLoad"] = totalTime,
+                ["totalFreezeTime"] = _totalFreezeTime,
+                ["maxFreezeTime"] = _maxFreezeTime,
+                ["closeTime"] = closeTime,
+            };
 
-                ctx.UpdateTarget(BuildDisplay());
-            });
+            File.WriteAllText(outputPath, JsonSerializer.Serialize(results, new JsonSerializerOptions { WriteIndented = true }));
+        }
+
+        //// Typing latency phase
+        //IRenderable BuildDisplay() => BuildLatencyDisplay(solutionSummary);
+
+        //AnsiConsole.Live(BuildDisplay())
+        //    .AutoClear(false)
+        //    .Start(ctx =>
+        //    {
+        //        while (!process.HasExited)
+        //        {
+        //            Thread.Sleep(200);
+        //            ctx.UpdateTarget(BuildDisplay());
+        //        }
+
+        //        ctx.UpdateTarget(BuildDisplay());
+        //    });
 
         server!.Dispose();
         return process.ExitCode;
@@ -274,6 +326,33 @@ static class Program
     {
         var index = (int)Math.Ceiling(sorted.Count * p / 100.0) - 1;
         return sorted[Math.Max(0, index)];
+    }
+
+    private const uint WM_CLOSE = 0x0010;
+
+    [DllImport("user32.dll")]
+    private static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
+    [DllImport("user32.dll")]
+    private static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    private static extern bool IsWindowVisible(IntPtr hWnd);
+
+    private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+    static void CloseProcessWindows(int processId)
+    {
+        EnumWindows((hWnd, _) =>
+        {
+            GetWindowThreadProcessId(hWnd, out var pid);
+            if (pid == (uint)processId && IsWindowVisible(hWnd))
+                PostMessage(hWnd, WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
+            return true;
+        }, IntPtr.Zero);
     }
 
     static void OnMessageReceived(long timestamp, MessageType type, byte[] payload)
