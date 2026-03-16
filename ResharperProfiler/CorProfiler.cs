@@ -94,20 +94,15 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
 
         var fileName = Path.GetFileNameWithoutExtension(moduleInfo.ModuleName);
 
-        if (fileName.StartsWith("JetBrains", StringComparison.OrdinalIgnoreCase))
-        {
-            //Log.Write($"Module loaded: {fileName} (id: {moduleId.Value:x2})");
-        }
-
         if ("JetBrains.Platform.VisualStudio.SinceVs17".Equals(fileName, StringComparison.OrdinalIgnoreCase))
         {
             Log.Write($"Entry point module loaded (id: {moduleId.Value:x2}), hooking startup");
-            // JetBrains.Platform.VisualStudio.SinceVs17.Env.Package.VsAsyncPackage17.Microsoft.VisualStudio.Shell.Interop.IAsyncLoadablePackageInitialize.Initialize
             var result = HookMethod(moduleId, "JetBrains.Platform.VisualStudio.SinceVs17.Env.Package.VsAsyncPackage17", "Microsoft.VisualStudio.Shell.Interop.IAsyncLoadablePackageInitialize.Initialize", &OnStartupCallback, instrumentMethodStart: true);
 
             if (!result)
             {
                 Log.Write($"Failed to hook startup: {result}");
+                _pipeClient?.ReportPhase(Phase.Startup, success: false, statusMessage: $"Failed to hook startup method: {result}, UI freeze detection won't be available");
             }
 
             return HResult.S_OK;
@@ -122,6 +117,7 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
             if (!result)
             {
                 Log.Write($"Failed to hook daemon ready: {result}");
+                _pipeClient?.ReportPhase(Phase.DaemonFinished, success: false, statusMessage: $"Failed to hook DaemonFinished method: {result}");
             }
 
             return result;
@@ -135,6 +131,7 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
             if (!result)
             {
                 Log.Write($"Failed to hook save caches: {result}");
+                _pipeClient?.ReportPhase(Phase.SaveCaches, success: false, statusMessage: $"Failed to hook SaveCaches method: {result}");
             }
 
             _pipeClient?.ReportPhase(Phase.SolutionListenerReady);
@@ -256,13 +253,6 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
         int index = 0;
         int InstructionIndex() => instrumentMethodStart ? index++ : method.Body.Instructions.Count - 1;
 
-        Log.Write($"BEFORE - Dumping {method.Body.ExceptionHandlers.Count} exception handling sections for {typeName}.{methodName}");
-
-        foreach (var eh in method.Body.ExceptionHandlers)
-        {
-            Log.Write($"EH: Try[{eh.TryStart}, {eh.TryEnd}] Handler[{eh.HandlerStart}, {eh.HandlerEnd}] Type={eh.HandlerType}");
-        }
-
         method.Body.Instructions.Insert(InstructionIndex(), Instruction.Create(OpCodes.Ldc_I8, GCHandle.ToIntPtr(_thisHandle)));
         method.Body.Instructions.Insert(InstructionIndex(), Instruction.Create(OpCodes.Conv_I));
         method.Body.Instructions.Insert(InstructionIndex(), Instruction.Create(OpCodes.Ldc_I8, (nint)callback));
@@ -270,14 +260,6 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
         method.Body.Instructions.Insert(InstructionIndex(), Instruction.Create(OpCodes.Calli, sig));
 
         method.Body.UpdateInstructionOffsets();
-
-        Log.Write($"AFTER - Dumping {method.Body.ExceptionHandlers.Count} exception handling sections for {typeName}.{methodName}");
-
-        foreach (var eh in method.Body.ExceptionHandlers)
-        {
-            Log.Write($"EH: Try[{eh.TryStart}, {eh.TryEnd}] Handler[{eh.HandlerStart}, {eh.HandlerEnd}] Type={eh.HandlerType}");
-        }
-
 
         ilRewriter.Export(method);
 

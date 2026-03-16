@@ -144,7 +144,7 @@ static class Program
             .Spinner(Spinner.Known.Dots)
             .Start("Starting...", ctx =>
             {
-                WriteStep($"Process [bold]{process.Id}[/] started");
+                WriteStep($"Process [bold]{process.Id}[/] started", true);
 
                 ctx.Status("Waiting for profiler to connect...");
                 while (!serverReady.Wait(1000))
@@ -165,12 +165,12 @@ static class Program
                     return;
                 }
 
-                WriteStep("Profiler connected");
+                WriteStep("Profiler connected", true);
 
                 ctx.Status("Waiting for solution listener...");
                 WaitForAny(SolutionListenerReady, process);
                 if (SolutionListenerReady.IsSet)
-                    WriteStep("Solution listener ready");
+                    WriteStep("Solution listener ready", true);
 
                 ctx.Status("Waiting for solution to load...");
                 WaitForAny(SolutionLoaded, process);
@@ -247,10 +247,13 @@ static class Program
         return process.ExitCode;
     }
 
-    static void WriteStep(string message)
+    static void WriteStep(string message, bool success)
     {
         var elapsed = (Environment.TickCount64 - _startupTime) / 1000.0;
-        AnsiConsole.MarkupLine($"  [dim]{elapsed,6:F1}s[/]  [green]✓[/] {message}");
+
+        var symbol = success ? "[green]✓[/]" : "[red]X[/]";
+
+        AnsiConsole.MarkupLine($"  [dim]{elapsed,6:F1}s[/]  {symbol} {message}");
     }
 
     static void WaitForAny(ManualResetEventSlim signal, Process process)
@@ -372,9 +375,18 @@ static class Program
 
             case MessageType.Phase:
             {
-                var phase = (Phase)payload[0];
+                using var reader = new BinaryReader(new MemoryStream(payload), Encoding.UTF8);
+                var phase = (Phase)reader.ReadByte();
+                var success = reader.ReadBoolean();
+                var statusMessage = reader.ReadString();
                 if (_debug)
-                    Console.WriteLine($"[{timestamp}] Phase: {phase}");
+                    Console.WriteLine($"[{timestamp}] Phase: {phase} (success: {success}{(statusMessage.Length > 0 ? $", {statusMessage}" : "")})");
+                if (!success)
+                {
+                    var detail = statusMessage.Length > 0 ? $" - {statusMessage}" : "";
+                    WriteStep($"{phase}{detail}", false);
+                    break;
+                }
                 switch (phase)
                 {
                     case Phase.SolutionListenerReady:

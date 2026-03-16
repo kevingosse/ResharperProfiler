@@ -52,9 +52,14 @@ public abstract class PipeEndpoint : IDisposable
         Send(MessageType.Log, w => w.Write(message));
     }
 
-    public void ReportPhase(Phase phase)
+    public void ReportPhase(Phase phase, bool success = true, string? statusMessage = null)
     {
-        Send(MessageType.Phase, w => w.Write((byte)phase));
+        Send(MessageType.Phase, w =>
+        {
+            w.Write((byte)phase);
+            w.Write(success);
+            w.Write(statusMessage ?? string.Empty);
+        });
     }
 
 
