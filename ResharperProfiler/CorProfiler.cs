@@ -1,5 +1,4 @@
 ﻿using System.Collections.Concurrent;
-using System.ComponentModel;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using dnlib.DotNet;
@@ -15,6 +14,7 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
 {
     private Client? _pipeClient;
     private uint _mainThreadId;
+    private readonly CancellationTokenSource _shutdownToken = new();
     private readonly ManualResetEventSlim _solutionLoadMutex = new(false);
     private readonly ManualResetEventSlim _responsiveMutex = new(false);
     private readonly CancellationTokenSource _solutionLoaded = new();
@@ -77,6 +77,12 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
         return HResult.S_OK;
     }
 
+    protected override HResult Shutdown()
+    {
+        _shutdownToken.Cancel();
+        return HResult.S_OK;
+    }
+
     protected override HResult ModuleLoadFinished(ModuleId moduleId, HResult hrStatus)
     {
         if (!hrStatus)
@@ -93,6 +99,20 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
             //Log.Write($"Module loaded: {fileName} (id: {moduleId.Value:x2})");
         }
 
+        if ("JetBrains.Platform.VisualStudio.SinceVs17".Equals(fileName, StringComparison.OrdinalIgnoreCase))
+        {
+            Log.Write($"Entry point module loaded (id: {moduleId.Value:x2}), hooking startup");
+            // JetBrains.Platform.VisualStudio.SinceVs17.Env.Package.VsAsyncPackage17.Microsoft.VisualStudio.Shell.Interop.IAsyncLoadablePackageInitialize.Initialize
+            var result = HookMethod(moduleId, "JetBrains.Platform.VisualStudio.SinceVs17.Env.Package.VsAsyncPackage17", "Microsoft.VisualStudio.Shell.Interop.IAsyncLoadablePackageInitialize.Initialize", &OnStartupCallback, instrumentMethodStart: true);
+
+            if (!result)
+            {
+                Log.Write($"Failed to hook startup: {result}");
+            }
+
+            return HResult.S_OK;
+        }
+
         if ("JetBrains.ReSharper.Feature.Services".Equals(fileName, StringComparison.OrdinalIgnoreCase))
         {
             Log.Write($"Feature services module loaded (id: {moduleId.Value:x2}), hooking daemon ready");
@@ -103,8 +123,6 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
             {
                 Log.Write($"Failed to hook daemon ready: {result}");
             }
-
-            _solutionLoadMutex.Set();
 
             return result;
         }
@@ -127,8 +145,18 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
         return HResult.S_OK;
     }
 
+
+
     [UnmanagedCallersOnly]
-    private static void OnSaveCachesCallback(IntPtr instance)
+    private static void OnStartupCallback(IntPtr instance) => CallProfiler(instance, profiler => profiler.OnStartup());
+
+    [UnmanagedCallersOnly]
+    private static void OnSaveCachesCallback(IntPtr instance) => CallProfiler(instance, profiler => profiler.OnSaveCaches());
+
+    [UnmanagedCallersOnly]
+    private static void OnDaemonFinishedCallback(IntPtr instance) => CallProfiler(instance, profiler => profiler.OnDaemonFinished());
+
+    private static void CallProfiler(IntPtr instance, Action<CorProfiler> action)
     {
         try
         {
@@ -136,7 +164,7 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
 
             if (target is CorProfiler profiler)
             {
-                profiler.OnSaveCaches();
+                action(profiler);
             }
             else
             {
@@ -147,6 +175,13 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
         {
             Log.Write($"Failed to get CorProfiler instance from callback (ptr: {instance:x2}): {ex}");
         }
+    }
+
+    private void OnStartup()
+    {
+        _solutionLoadMutex.Set();
+        _pipeClient?.ReportPhase(Phase.Startup);
+        Log.Write("Resharper startup detected");
     }
 
     private void OnSaveCaches()
@@ -157,29 +192,6 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
         Log.Write($"Total input events sent: {_sentInput}, received: {_receivedInput}");
     }
 
-
-    [UnmanagedCallersOnly]
-    private static void OnDaemonFinishedCallback(IntPtr instance)
-    {
-        try
-        {
-            var target = GCHandle.FromIntPtr(instance).Target;
-
-            if (target is CorProfiler profiler)
-            {
-                profiler.OnDaemonFinished();
-            }
-            else
-            {
-                Log.Write($"Failed to get CorProfiler instance from callback (ptr: {instance:x2})");
-            }
-        }
-        catch (InvalidOperationException ex)
-        {
-            Log.Write($"Failed to get CorProfiler instance from callback (ptr: {instance:x2}): {ex}");
-        }
-    }
-
     private void OnDaemonFinished()
     {
         if (_solutionLoaded.IsCancellationRequested)
@@ -187,7 +199,7 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
             return;
         }
 
-        _pipeClient?.ReportPhase(Phase.DaemonFinished);        
+        _pipeClient?.ReportPhase(Phase.DaemonFinished);
     }
 
     private static Client? CreatePipeClient()
@@ -238,19 +250,34 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
         var ilRewriter = Silhouette.IL.IlRewriter.Create(ICorProfilerInfo3);
         using var method = ilRewriter.Import(moduleId, methodDef);
 
-        var ptr = (nint)(delegate* unmanaged<IntPtr, void>)&OnSaveCachesCallback;
-
         var sig = MethodSig.CreateStatic(method.Metadata.CorLibTypes.Void, method.Metadata.CorLibTypes.IntPtr);
         sig.CallingConvention = dnlib.DotNet.CallingConvention.Unmanaged;
 
         int index = 0;
         int InstructionIndex() => instrumentMethodStart ? index++ : method.Body.Instructions.Count - 1;
 
+        Log.Write($"BEFORE - Dumping {method.Body.ExceptionHandlers.Count} exception handling sections for {typeName}.{methodName}");
+
+        foreach (var eh in method.Body.ExceptionHandlers)
+        {
+            Log.Write($"EH: Try[{eh.TryStart}, {eh.TryEnd}] Handler[{eh.HandlerStart}, {eh.HandlerEnd}] Type={eh.HandlerType}");
+        }
+
         method.Body.Instructions.Insert(InstructionIndex(), Instruction.Create(OpCodes.Ldc_I8, GCHandle.ToIntPtr(_thisHandle)));
         method.Body.Instructions.Insert(InstructionIndex(), Instruction.Create(OpCodes.Conv_I));
-        method.Body.Instructions.Insert(InstructionIndex(), Instruction.Create(OpCodes.Ldc_I8, ptr));
+        method.Body.Instructions.Insert(InstructionIndex(), Instruction.Create(OpCodes.Ldc_I8, (nint)callback));
         method.Body.Instructions.Insert(InstructionIndex(), Instruction.Create(OpCodes.Conv_I));
         method.Body.Instructions.Insert(InstructionIndex(), Instruction.Create(OpCodes.Calli, sig));
+
+        method.Body.UpdateInstructionOffsets();
+
+        Log.Write($"AFTER - Dumping {method.Body.ExceptionHandlers.Count} exception handling sections for {typeName}.{methodName}");
+
+        foreach (var eh in method.Body.ExceptionHandlers)
+        {
+            Log.Write($"EH: Try[{eh.TryStart}, {eh.TryEnd}] Handler[{eh.HandlerStart}, {eh.HandlerEnd}] Type={eh.HandlerType}");
+        }
+
 
         ilRewriter.Export(method);
 
@@ -263,7 +290,7 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
 
         var stopwatch = Stopwatch.StartNew();
 
-        while (true)
+        while (!_shutdownToken.IsCancellationRequested)
         {
             if (_responsiveMutex.Wait(20))
             {
@@ -296,7 +323,7 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
                     stopwatch.Restart();
 
                     // Now wait indefinitely
-                    _responsiveMutex.Wait();
+                    _responsiveMutex.Wait(_shutdownToken.Token);
                 }
             }
         }
@@ -318,12 +345,14 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
 
             var inputSize = Marshal.SizeOf<NativeMethods.INPUT>();
 
-            while (true)
+            while (!_shutdownToken.IsCancellationRequested)
             {
                 Thread.Sleep(10);
 
                 if (Environment.TickCount64 < Interlocked.Read(ref _suspendUntilTicks))
+                {
                     continue;
+                }
 
                 WaitForMainWindow();
 
@@ -355,16 +384,6 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
 
     private void LowLevelHookThread()
     {
-        IntPtr LowLevelHookProc(int code, IntPtr wParam, IntPtr lParam)
-        {
-            if (code >= 0)
-            {
-                _keyTimestamps.Enqueue(Stopwatch.GetTimestamp());
-            }
-
-            return NativeMethods.CallNextHookEx(0, code, wParam, lParam);
-        }
-
         // LL hooks require hMod=0, dwThreadId=0 for global hook
         var hook = NativeMethods.SetWindowsHookEx(NativeMethods.HookType.WH_KEYBOARD_LL, LowLevelHookProc, 0, 0);
 
@@ -375,10 +394,22 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
         }
 
         // Message pump to keep the LL hook alive
-        while (NativeMethods.GetMessage(out var msg, IntPtr.Zero, 0, 0) > 0)
+        while (!_shutdownToken.IsCancellationRequested && NativeMethods.GetMessage(out var msg, IntPtr.Zero, 0, 0) > 0)
         {
             NativeMethods.TranslateMessage(ref msg);
             NativeMethods.DispatchMessage(ref msg);
+        }
+
+        return;
+
+        IntPtr LowLevelHookProc(int code, IntPtr wParam, IntPtr lParam)
+        {
+            if (code >= 0)
+            {
+                _keyTimestamps.Enqueue(Stopwatch.GetTimestamp());
+            }
+
+            return NativeMethods.CallNextHookEx(0, code, wParam, lParam);
         }
     }
 
