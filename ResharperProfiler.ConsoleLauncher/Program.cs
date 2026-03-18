@@ -26,6 +26,7 @@ static class Program
     {
         string? outputPath = null;
         string? benchmarkOutputPath = null;
+        string? productVersion = null;
 
         if (args is ["--debug", .. var rest])
         {
@@ -35,7 +36,6 @@ static class Program
 
         if (args is ["--output", var path, .. var rest2])
         {
-
             outputPath = path;
             args = rest2;
         }
@@ -46,9 +46,15 @@ static class Program
             args = rest3;
         }
 
+        if (args is ["--product-version", var ver, .. var rest4])
+        {
+            productVersion = ver;
+            args = rest4;
+        }
+
         if (args.Length == 0)
         {
-            Console.Error.WriteLine("Usage: ResharperProfiler.ConsoleLauncher [--debug] [--output <path>] [--benchmark-output <path>] <executable> [args...]");
+            Console.Error.WriteLine("Usage: ResharperProfiler.ConsoleLauncher [--debug] [--output <path>] [--benchmark-output <path>] [--product-version <name>] <executable> [args...]");
             return 1;
         }
 
@@ -236,11 +242,12 @@ static class Program
 
         if (benchmarkOutputPath is not null)
         {
-            var benchmarkResults = new object[]
+            var benchmarkResults = new
             {
-                new { name = "Solution Load", unit = "ms", value = totalTime },
-                new { name = "Total UI Freeze", unit = "ms", value = _totalFreezeTime },
-                new { name = "Close Time", unit = "ms", value = closeTime },
+                version = productVersion ?? "unknown",
+                solutionLoad = totalTime,
+                totalFreezeTime = _totalFreezeTime,
+                closeTime = closeTime,
             };
 
             File.WriteAllText(benchmarkOutputPath, JsonSerializer.Serialize(benchmarkResults, new JsonSerializerOptions { WriteIndented = true }));

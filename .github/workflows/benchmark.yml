@@ -3,13 +3,12 @@ name: Benchmark Dashboard
 on:
   push:
     branches:
-      - master
+      - benchmark-data
     paths:
       - 'results/benchmark-results.json'
 
 permissions:
   contents: write
-  deployments: write
 
 jobs:
   publish:
@@ -17,12 +16,41 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Store benchmark result
-        uses: benchmark-action/github-action-benchmark@v1
-        with:
-          name: ReSharper Profiler
-          tool: 'customSmallerIsBetter'
-          output-file-path: results/benchmark-results.json
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          auto-push: true
-          summary-always: true
+      - name: Update dashboard data
+        run: |
+          # Read the new benchmark result
+          RESULT=$(cat results/benchmark-results.json)
+          DATE=$(date -u +%Y-%m-%d)
+
+          # Build the new entry with date metadata
+          ENTRY=$(echo "$RESULT" | jq --arg date "$DATE" '{
+            version: .version,
+            date: $date,
+            metrics: {
+              solutionLoad: .solutionLoad,
+              totalFreezeTime: .totalFreezeTime,
+              closeTime: .closeTime
+            }
+          }')
+
+          # Fetch gh-pages and master
+          git fetch origin gh-pages:gh-pages 2>/dev/null || true
+          git fetch origin master:refs/remotes/origin/master
+
+          # Get existing data from gh-pages (if any)
+          EXISTING=$(git show gh-pages:data.json 2>/dev/null || echo '[]')
+
+          # Append the new entry
+          echo "$EXISTING" | jq --argjson entry "$ENTRY" '. + [$entry]' > /tmp/data.json
+
+          # Switch to gh-pages and update
+          git checkout gh-pages
+
+          cp /tmp/data.json data.json
+          git show origin/master:dashboard/index.html > index.html
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data.json index.html
+          git commit -m "Update benchmark data for $(echo "$ENTRY" | jq -r .version) ($DATE)" || echo "No changes to commit"
+          git push origin gh-pages
