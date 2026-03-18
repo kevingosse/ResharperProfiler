@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1773843833746,
+  "lastUpdate": 1773844384577,
   "repoUrl": "https://github.com/kevingosse/ResharperProfiler",
   "entries": {
     "ReSharper Profiler": [
@@ -43,6 +43,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "Close Time",
             "value": 10453,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "krix33@gmail.com",
+            "name": "Kevin Gosse",
+            "username": "kevingosse"
+          },
+          "committer": {
+            "email": "krix33@gmail.com",
+            "name": "Kevin Gosse",
+            "username": "kevingosse"
+          },
+          "distinct": true,
+          "id": "d5e06f8501bfcdedd5f96e217556381a5f6a074f",
+          "message": "new results",
+          "timestamp": "2026-03-18T15:32:47+01:00",
+          "tree_id": "332391673d2eb688c698292bfd9cec1bc6bbdf2a",
+          "url": "https://github.com/kevingosse/ResharperProfiler/commit/d5e06f8501bfcdedd5f96e217556381a5f6a074f"
+        },
+        "date": 1773844383825,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "Solution Load",
+            "value": 77766,
+            "unit": "ms"
+          },
+          {
+            "name": "Total UI Freeze",
+            "value": 22814,
+            "unit": "ms"
+          },
+          {
+            "name": "Close Time",
+            "value": 8015,
             "unit": "ms"
           }
         ]
