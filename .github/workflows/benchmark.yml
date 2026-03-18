@@ -1,0 +1,28 @@
+name: Benchmark Dashboard
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - 'results/benchmark-results.json'
+
+permissions:
+  contents: write
+  deployments: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Store benchmark result
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: ReSharper Profiler
+          tool: 'customSmallerIsBetter'
+          output-file-path: results/benchmark-results.json
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: true
+          summary-always: true

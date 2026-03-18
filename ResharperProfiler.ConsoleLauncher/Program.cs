@@ -25,6 +25,7 @@ static class Program
     static int Main(string[] args)
     {
         string? outputPath = null;
+        string? benchmarkOutputPath = null;
 
         if (args is ["--debug", .. var rest])
         {
@@ -34,14 +35,20 @@ static class Program
 
         if (args is ["--output", var path, .. var rest2])
         {
-            
+
             outputPath = path;
             args = rest2;
         }
 
+        if (args is ["--benchmark-output", var bpath, .. var rest3])
+        {
+            benchmarkOutputPath = bpath;
+            args = rest3;
+        }
+
         if (args.Length == 0)
         {
-            Console.Error.WriteLine("Usage: ResharperProfiler.ConsoleLauncher [--debug] [--output <path>] <executable> [args...]");
+            Console.Error.WriteLine("Usage: ResharperProfiler.ConsoleLauncher [--debug] [--output <path>] [--benchmark-output <path>] <executable> [args...]");
             return 1;
         }
 
@@ -225,6 +232,18 @@ static class Program
             };
 
             File.WriteAllText(outputPath, JsonSerializer.Serialize(results, new JsonSerializerOptions { WriteIndented = true }));
+        }
+
+        if (benchmarkOutputPath is not null)
+        {
+            var benchmarkResults = new object[]
+            {
+                new { name = "Solution Load", unit = "ms", value = totalTime },
+                new { name = "Total UI Freeze", unit = "ms", value = _totalFreezeTime },
+                new { name = "Close Time", unit = "ms", value = closeTime },
+            };
+
+            File.WriteAllText(benchmarkOutputPath, JsonSerializer.Serialize(benchmarkResults, new JsonSerializerOptions { WriteIndented = true }));
         }
 
         //// Typing latency phase
