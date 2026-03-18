@@ -29,39 +29,40 @@ static class Program
         string? productVersion = null;
         string benchmarkDate = DateTime.UtcNow.ToString("yyyy-MM-dd");
 
-        if (args is ["--debug", .. var rest])
+        var i = 0;
+        for (; i < args.Length; i++)
         {
-            _debug = true;
-            args = rest;
+            switch (args[i])
+            {
+                case "--debug":
+                    _debug = true;
+                    break;
+                case "--output":
+                    outputPath = args[++i];
+                    break;
+                case "--benchmark-output":
+                    benchmarkOutputPath = args[++i];
+                    break;
+                case "--product-version":
+                    productVersion = args[++i];
+                    break;
+                case "--date":
+                    benchmarkDate = args[++i];
+                    break;
+                case "--":
+                    i++;
+                    goto done;
+                default:
+                    goto done;
+            }
         }
+        done:
 
-        if (args is ["--output", var path, .. var rest2])
-        {
-            outputPath = path;
-            args = rest2;
-        }
-
-        if (args is ["--benchmark-output", var bpath, .. var rest3])
-        {
-            benchmarkOutputPath = bpath;
-            args = rest3;
-        }
-
-        if (args is ["--product-version", var ver, .. var rest4])
-        {
-            productVersion = ver;
-            args = rest4;
-        }
-
-        if (args is ["--date", var dateStr, .. var rest5])
-        {
-            benchmarkDate = dateStr;
-            args = rest5;
-        }
+        args = args[i..];
 
         if (args.Length == 0)
         {
-            Console.Error.WriteLine("Usage: ResharperProfiler.ConsoleLauncher [--debug] [--output <path>] [--benchmark-output <path>] [--product-version <name>] [--date <yyyy-MM-dd>] <executable> [args...]");
+            Console.Error.WriteLine("Usage: ResharperProfiler.ConsoleLauncher [options] -- <executable> [args...]");
             return 1;
         }
 
@@ -109,8 +110,8 @@ static class Program
         // Launch the target process with profiler environment variables
         var psi = new ProcessStartInfo(args[0]) { UseShellExecute = false };
 
-        for (var i = 1; i < args.Length; i++)
-            psi.ArgumentList.Add(args[i]);
+        for (var j = 1; j < args.Length; j++)
+            psi.ArgumentList.Add(args[j]);
 
         psi.Environment["COR_PROFILER"] = ProfilerGuid;
         psi.Environment["COR_ENABLE_PROFILING"] = "1";
