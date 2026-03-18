@@ -27,6 +27,7 @@ static class Program
         string? outputPath = null;
         string? benchmarkOutputPath = null;
         string? productVersion = null;
+        string benchmarkDate = DateTime.UtcNow.ToString("yyyy-MM-dd");
 
         if (args is ["--debug", .. var rest])
         {
@@ -52,9 +53,15 @@ static class Program
             args = rest4;
         }
 
+        if (args is ["--date", var dateStr, .. var rest5])
+        {
+            benchmarkDate = dateStr;
+            args = rest5;
+        }
+
         if (args.Length == 0)
         {
-            Console.Error.WriteLine("Usage: ResharperProfiler.ConsoleLauncher [--debug] [--output <path>] [--benchmark-output <path>] [--product-version <name>] <executable> [args...]");
+            Console.Error.WriteLine("Usage: ResharperProfiler.ConsoleLauncher [--debug] [--output <path>] [--benchmark-output <path>] [--product-version <name>] [--date <yyyy-MM-dd>] <executable> [args...]");
             return 1;
         }
 
@@ -245,6 +252,7 @@ static class Program
             var benchmarkResults = new
             {
                 version = productVersion ?? "unknown",
+                date = benchmarkDate,
                 solutionLoad = totalTime,
                 totalFreezeTime = _totalFreezeTime,
                 closeTime = closeTime,

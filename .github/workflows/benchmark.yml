@@ -20,18 +20,18 @@ jobs:
         run: |
           # Read the new benchmark result
           RESULT=$(cat results/benchmark-results.json)
-          DATE=$(date -u +%Y-%m-%d)
 
-          # Build the new entry with date metadata
-          ENTRY=$(echo "$RESULT" | jq --arg date "$DATE" '{
+          # Build the new entry
+          ENTRY=$(echo "$RESULT" | jq '{
             version: .version,
-            date: $date,
+            date: .date,
             metrics: {
               solutionLoad: .solutionLoad,
               totalFreezeTime: .totalFreezeTime,
               closeTime: .closeTime
             }
           }')
+          DATE=$(echo "$ENTRY" | jq -r .date)
 
           # Fetch gh-pages and master
           git fetch origin gh-pages:gh-pages 2>/dev/null || true
