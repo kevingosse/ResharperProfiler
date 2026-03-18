@@ -1,0 +1,22 @@
+[
+  {
+    "name": "Solution Load",
+    "unit": "ms",
+    "value": 108953
+  },
+  {
+    "name": "Total UI Freeze",
+    "unit": "ms",
+    "value": 16287
+  },
+  {
+    "name": "Max UI Freeze",
+    "unit": "ms",
+    "value": 1307
+  },
+  {
+    "name": "Close Time",
+    "unit": "ms",
+    "value": 10453
+  }
+]
