@@ -16,6 +16,8 @@ static class Program
     private static long _startupTime;
     private static bool _debug;
 
+    private record RunResult(long SolutionLoad, long TotalFreezeTime, long MaxFreezeTime, long CloseTime);
+
     private static readonly ManualResetEventSlim SolutionListenerReady = new();
     private static readonly ManualResetEventSlim SolutionLoaded = new();
 
@@ -28,6 +30,7 @@ static class Program
         string? benchmarkOutputPath = null;
         string? productVersion = null;
         string benchmarkDate = DateTime.UtcNow.ToString("yyyy-MM-dd");
+        int runs = 1;
 
         var i = 0;
         for (; i < args.Length; i++)
@@ -48,6 +51,14 @@ static class Program
                     break;
                 case "--date":
                     benchmarkDate = args[++i];
+                    break;
+                case "--runs":
+                    runs = int.Parse(args[++i]);
+                    if (runs < 1)
+                    {
+                        Console.Error.WriteLine("--runs must be at least 1");
+                        return 1;
+                    }
                     break;
                 case "--":
                     i++;
@@ -74,6 +85,68 @@ static class Program
             Console.Error.WriteLine("Run Build.ps1 first.");
             return 1;
         }
+
+        var allResults = new List<RunResult>();
+        var totalStopwatch = Stopwatch.StartNew();
+
+        for (var run = 0; run < runs; run++)
+        {
+            if (runs > 1)
+                AnsiConsole.MarkupLine($"\n[bold]═══ Run {run + 1}/{runs} ═══[/]\n");
+
+            var result = ExecuteRun(profilerDll, args);
+
+            if (result is null)
+                return 1;
+
+            allResults.Add(result);
+        }
+
+        totalStopwatch.Stop();
+
+        if (runs > 1)
+            PrintSummary(allResults, totalStopwatch.Elapsed);
+
+        var lastResult = allResults[^1];
+
+        if (outputPath is not null)
+        {
+            var results = new Dictionary<string, long>
+            {
+                ["solutionLoad"] = lastResult.SolutionLoad,
+                ["totalFreezeTime"] = lastResult.TotalFreezeTime,
+                ["maxFreezeTime"] = lastResult.MaxFreezeTime,
+                ["closeTime"] = lastResult.CloseTime,
+            };
+
+            File.WriteAllText(outputPath, JsonSerializer.Serialize(results, new JsonSerializerOptions { WriteIndented = true }));
+        }
+
+        if (benchmarkOutputPath is not null)
+        {
+            var benchmarkResults = new
+            {
+                version = productVersion ?? "unknown",
+                date = benchmarkDate,
+                solutionLoad = lastResult.SolutionLoad,
+                totalFreezeTime = lastResult.TotalFreezeTime,
+                closeTime = lastResult.CloseTime,
+            };
+
+            File.WriteAllText(benchmarkOutputPath, JsonSerializer.Serialize(benchmarkResults, new JsonSerializerOptions { WriteIndented = true }));
+        }
+
+        return 0;
+    }
+
+    static RunResult? ExecuteRun(string profilerDll, string[] args)
+    {
+        // Reset per-run state
+        _totalFreezeTime = 0;
+        _maxFreezeTime = 0;
+        SolutionListenerReady.Reset();
+        SolutionLoaded.Reset();
+        Latencies.Clear();
 
         var pipeName = $"ResharperProfiler_{Guid.NewGuid():N}";
 
@@ -123,7 +196,7 @@ static class Program
         if (process is null)
         {
             Console.Error.WriteLine($"Failed to start: {args[0]}");
-            return 1;
+            return null;
         }
 
         _startupTime = Environment.TickCount64;
@@ -137,7 +210,7 @@ static class Program
                 if (process.HasExited)
                 {
                     Console.Error.WriteLine($"Process exited ({process.ExitCode}) before profiler connected.");
-                    return process.ExitCode;
+                    return null;
                 }
             }
 
@@ -145,14 +218,14 @@ static class Program
             {
                 Console.Error.WriteLine($"Pipe server error: {serverError.Message}");
                 process.Kill();
-                return 1;
+                return null;
             }
 
             Console.WriteLine("Profiler connected.");
 
             process.WaitForExit();
             server!.Dispose();
-            return process.ExitCode;
+            return new RunResult(0, _totalFreezeTime, _maxFreezeTime, 0);
         }
 
         // Startup phase
@@ -226,60 +299,70 @@ static class Program
         if (!startupOk)
         {
             server?.Dispose();
-            return process.HasExited ? process.ExitCode : 1;
+            return null;
         }
 
         if (ungracefulExit)
         {
             server?.Dispose();
-            return 1;
+            return null;
         }
-
-        if (outputPath is not null)
-        {
-            var results = new Dictionary<string, long>
-            {
-                ["solutionLoad"] = totalTime,
-                ["totalFreezeTime"] = _totalFreezeTime,
-                ["maxFreezeTime"] = _maxFreezeTime,
-                ["closeTime"] = closeTime,
-            };
-
-            File.WriteAllText(outputPath, JsonSerializer.Serialize(results, new JsonSerializerOptions { WriteIndented = true }));
-        }
-
-        if (benchmarkOutputPath is not null)
-        {
-            var benchmarkResults = new
-            {
-                version = productVersion ?? "unknown",
-                date = benchmarkDate,
-                solutionLoad = totalTime,
-                totalFreezeTime = _totalFreezeTime,
-                closeTime = closeTime,
-            };
-
-            File.WriteAllText(benchmarkOutputPath, JsonSerializer.Serialize(benchmarkResults, new JsonSerializerOptions { WriteIndented = true }));
-        }
-
-        //// Typing latency phase
-        //IRenderable BuildDisplay() => BuildLatencyDisplay(solutionSummary);
-
-        //AnsiConsole.Live(BuildDisplay())
-        //    .AutoClear(false)
-        //    .Start(ctx =>
-        //    {
-        //        while (!process.HasExited)
-        //        {
-        //            Thread.Sleep(200);
-        //            ctx.UpdateTarget(BuildDisplay());
-        //        }
-
-        //        ctx.UpdateTarget(BuildDisplay());
-        //    });
 
         server!.Dispose();
-        return process.ExitCode;
+        return new RunResult(totalTime, _totalFreezeTime, _maxFreezeTime, closeTime);
+    }
+
+    static void PrintSummary(List<RunResult> results, TimeSpan totalDuration)
+    {
+        AnsiConsole.MarkupLine("\n[bold]═══ Summary ═══[/]\n");
+
+        var table = new Table();
+        table.AddColumn("Metric");
+        table.AddColumn(new TableColumn("Min").RightAligned());
+        table.AddColumn(new TableColumn("Max").RightAligned());
+        table.AddColumn(new TableColumn("Avg").RightAligned());
+        table.AddColumn(new TableColumn("Median").RightAligned());
+
+        AddMetricRow(table, "Solution Load (ms)", results.Select(r => r.SolutionLoad).ToList());
+        AddMetricRow(table, "Total Freeze (ms)", results.Select(r => r.TotalFreezeTime).ToList());
+        AddMetricRow(table, "Max Freeze (ms)", results.Select(r => r.MaxFreezeTime).ToList());
+        AddMetricRow(table, "Close Time (ms)", results.Select(r => r.CloseTime).ToList());
+
+        AnsiConsole.Write(table);
+
+        AnsiConsole.MarkupLine($"\n  [dim]Runs: {results.Count}  |  Total duration: {totalDuration.TotalSeconds:F1}s[/]");
+
+        // Per-run details
+        var detailTable = new Table();
+        detailTable.AddColumn("Run");
+        detailTable.AddColumn(new TableColumn("Solution Load").RightAligned());
+        detailTable.AddColumn(new TableColumn("Total Freeze").RightAligned());
+        detailTable.AddColumn(new TableColumn("Max Freeze").RightAligned());
+        detailTable.AddColumn(new TableColumn("Close Time").RightAligned());
+
+        for (var i = 0; i < results.Count; i++)
+        {
+            var r = results[i];
+            detailTable.AddRow(
+                $"{i + 1}",
+                $"{r.SolutionLoad} ms",
+                $"{r.TotalFreezeTime} ms",
+                $"{r.MaxFreezeTime} ms",
+                $"{r.CloseTime} ms");
+        }
+
+        AnsiConsole.Write(detailTable);
+    }
+
+    static void AddMetricRow(Table table, string label, List<long> values)
+    {
+        var sorted = values.OrderBy(x => x).ToList();
+        var min = sorted[0];
+        var max = sorted[^1];
+        var avg = sorted.Average();
+        var median = sorted[sorted.Count / 2];
+
+        table.AddRow(label, $"{min}", $"{max}", $"{avg:F0}", $"{median}");
     }
 
     static void WriteStep(string message, bool success)
