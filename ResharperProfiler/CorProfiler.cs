@@ -139,6 +139,19 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
             return result;
         }
 
+        if ("JetBrains.Platform.VisualStudio.Core".Equals(fileName, StringComparison.OrdinalIgnoreCase))
+        {
+            Log.Write($"VS Core module loaded (id: {moduleId.Value:x2}), hooking OOP detection");
+            var result = HookMethod(moduleId, "JetBrains.VsIntegration.BackendInterop.BackendEntry", "CreateBackend", &OnOopDetectedCallback, instrumentMethodStart: true);
+
+            if (!result)
+            {
+                Log.Write($"Failed to hook OOP detection: {result}");
+            }
+
+            return HResult.S_OK;
+        }
+
         return HResult.S_OK;
     }
 
@@ -152,6 +165,9 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
 
     [UnmanagedCallersOnly]
     private static void OnDaemonFinishedCallback(IntPtr instance) => CallProfiler(instance, profiler => profiler.OnDaemonFinished());
+
+    [UnmanagedCallersOnly]
+    private static void OnOopDetectedCallback(IntPtr instance) => CallProfiler(instance, profiler => profiler.OnOopDetected());
 
     private static void CallProfiler(IntPtr instance, Action<CorProfiler> action)
     {
@@ -197,6 +213,12 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
         }
 
         _pipeClient?.ReportPhase(Phase.DaemonFinished);
+    }
+
+    private void OnOopDetected()
+    {
+        Log.Write("ReSharper is running out-of-process, daemon detection won't work in this mode");
+        _pipeClient?.ReportPhase(Phase.DaemonFinished, success: false, statusMessage: "ReSharper is running out-of-process");
     }
 
     private static Client? CreatePipeClient()
