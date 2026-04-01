@@ -22,6 +22,7 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
     private long _receivedInput;
     private GCHandle _thisHandle;
     private readonly ConcurrentQueue<long> _keyTimestamps = new();
+    private bool _isBackend;
 
     protected override HResult Initialize(int iCorProfilerInfoVersion)
     {
@@ -32,15 +33,23 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
 
         var processName = Process.GetCurrentProcess().ProcessName;
 
-        if (processName != "devenv")
+        if (processName == "ReSharper.Backend64c")
+        {
+            _isBackend = true;
+        }
+        else if (processName != "devenv")
         {
             return HResult.CORPROF_E_PROFILER_CANCEL_ACTIVATION;
         }
 
-        Log.Write("Profiler loaded");
+        Log.Write($"Profiler loaded (process: {processName}, isBackend: {_isBackend})");
 
-        // Disable profiling for child processes
-        Environment.SetEnvironmentVariable("COR_ENABLE_PROFILING", "0");
+        // Disable profiling for child processes (unless OOP backend which inherits env vars)
+        if (!_isBackend)
+        {
+            Environment.SetEnvironmentVariable("COR_ENABLE_PROFILING", "0");
+            Environment.SetEnvironmentVariable("CORECLR_ENABLE_PROFILING", "0");
+        }
 
         _pipeClient = CreatePipeClient();
 
@@ -56,23 +65,27 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
         _mainThreadId = NativeMethods.GetCurrentThreadId();
         _thisHandle = GCHandle.Alloc(this);
 
-        new Thread(LowLevelHookThread)
+        // Input sending and UI freeze monitoring only apply to devenv.exe
+        if (!_isBackend)
         {
-            IsBackground = true,
-            Name = "UI Profiler LL Hook"
-        }.Start();
+            new Thread(LowLevelHookThread)
+            {
+                IsBackground = true,
+                Name = "UI Profiler LL Hook"
+            }.Start();
 
-        new Thread(InputThread)
-        {
-            IsBackground = true,
-            Name = "UI Profiler Monitor"
-        }.Start();
+            new Thread(InputThread)
+            {
+                IsBackground = true,
+                Name = "UI Profiler Monitor"
+            }.Start();
 
-        new Thread(MonitoringThread)
-        {
-            IsBackground = true,
-            Name = "UI Responsiveness Monitor"
-        }.Start();
+            new Thread(MonitoringThread)
+            {
+                IsBackground = true,
+                Name = "UI Responsiveness Monitor"
+            }.Start();
+        }
 
         return HResult.S_OK;
     }
@@ -94,7 +107,7 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
 
         var fileName = Path.GetFileNameWithoutExtension(moduleInfo.ModuleName);
 
-        if ("JetBrains.Platform.VisualStudio.SinceVs17".Equals(fileName, StringComparison.OrdinalIgnoreCase))
+        if (!_isBackend && "JetBrains.Platform.VisualStudio.SinceVs17".Equals(fileName, StringComparison.OrdinalIgnoreCase))
         {
             Log.Write($"Entry point module loaded (id: {moduleId.Value:x2}), hooking startup");
             var result = HookMethod(moduleId, "JetBrains.Platform.VisualStudio.SinceVs17.Env.Package.VsAsyncPackage17", "Microsoft.VisualStudio.Shell.Interop.IAsyncLoadablePackageInitialize.Initialize", &OnStartupCallback, instrumentMethodStart: true);
@@ -134,12 +147,13 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
                 _pipeClient?.ReportPhase(Phase.SaveCaches, success: false, statusMessage: $"Failed to hook SaveCaches method: {result}");
             }
 
-            _pipeClient?.ReportPhase(Phase.SolutionListenerReady);
+            if (!_isBackend)
+                _pipeClient?.ReportPhase(Phase.SolutionListenerReady);
 
             return result;
         }
 
-        if ("JetBrains.Platform.VisualStudio.Core".Equals(fileName, StringComparison.OrdinalIgnoreCase))
+        if (!_isBackend && "JetBrains.Platform.VisualStudio.Core".Equals(fileName, StringComparison.OrdinalIgnoreCase))
         {
             Log.Write($"VS Core module loaded (id: {moduleId.Value:x2}), hooking OOP detection");
             var result = HookMethod(moduleId, "JetBrains.VsIntegration.BackendInterop.BackendEntry", "CreateBackend", &OnOopDetectedCallback, instrumentMethodStart: true);
@@ -217,8 +231,11 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
 
     private void OnOopDetected()
     {
-        Log.Write("ReSharper is running out-of-process, daemon detection won't work in this mode");
-        _pipeClient?.ReportPhase(Phase.DaemonFinished, success: false, statusMessage: "ReSharper is running out-of-process");
+        Log.Write("ReSharper is running out-of-process, enabling profiler for backend process");
+        Environment.SetEnvironmentVariable("CORECLR_ENABLE_PROFILING", "1");
+        Environment.SetEnvironmentVariable("CORECLR_PROFILER", "{687FB688-F002-4B64-9A95-567E5502230F}");
+        Environment.SetEnvironmentVariable("CORECLR_PROFILER_PATH_64",
+            Environment.GetEnvironmentVariable("COR_PROFILER_PATH_64"));
     }
 
     private static Client? CreatePipeClient()

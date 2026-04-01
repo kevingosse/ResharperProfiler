@@ -12,7 +12,7 @@ public class Server : PipeEndpoint
     private static NamedPipeServerStream CreateAndWait(string pipeName)
     {
         var pipe = new NamedPipeServerStream(
-            pipeName, PipeDirection.InOut, 1,
+            pipeName, PipeDirection.InOut, NamedPipeServerStream.MaxAllowedServerInstances,
             PipeTransmissionMode.Byte, PipeOptions.Asynchronous,
             inBufferSize: 4096, outBufferSize: 4096);
         pipe.WaitForConnection();

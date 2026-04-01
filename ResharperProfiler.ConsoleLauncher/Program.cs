@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -21,8 +22,8 @@ static class Program
     private static readonly ManualResetEventSlim SolutionListenerReady = new();
     private static readonly ManualResetEventSlim SolutionLoaded = new();
 
-    private static readonly Lock LatencyLock = new();
-    private static readonly List<double> Latencies = new(); // in ms
+    private static readonly ConcurrentQueue<double> Latencies = new(); // in ms
+    private static readonly List<Server> Servers = new();
 
     static int Main(string[] args)
     {
@@ -67,7 +68,7 @@ static class Program
                     goto done;
             }
         }
-        done:
+    done:
 
         args = args[i..];
 
@@ -147,11 +148,12 @@ static class Program
         SolutionListenerReady.Reset();
         SolutionLoaded.Reset();
         Latencies.Clear();
+        Servers.Clear();
 
         var pipeName = $"ResharperProfiler_{Guid.NewGuid():N}";
 
         // Start the pipe server (constructor blocks until the profiler connects)
-        Server? server = null;
+        Server? server;
         Exception? serverError = null;
         var serverReady = new ManualResetEventSlim();
 
@@ -161,13 +163,18 @@ static class Program
             {
                 server = new Server(pipeName);
                 server.MessageReceived += OnMessageReceived;
-                server.Error += (context, ex) => Console.Error.WriteLine($"[PIPE ERROR] {context}: {ex}");
+                server.Error += (context, ex) => Console.Error.WriteLine($"[PIPE ERROR] devenv: {context}: {ex}");
                 server.Disconnected += () =>
                 {
                     if (_debug || !SolutionLoaded.IsSet)
-                        Console.Error.WriteLine("[PIPE] Disconnected");
+                        Console.Error.WriteLine("[PIPE] devenv disconnected");
                 };
+
+                Servers.Add(server);
                 server.Start();
+
+                // Start a second server instance for the OOP backend
+                AcceptBackendConnection(pipeName);
             }
             catch (Exception ex)
             {
@@ -189,6 +196,9 @@ static class Program
         psi.Environment["COR_PROFILER"] = ProfilerGuid;
         psi.Environment["COR_ENABLE_PROFILING"] = "1";
         psi.Environment["COR_PROFILER_PATH_64"] = profilerDll;
+        psi.Environment["CORECLR_PROFILER"] = ProfilerGuid;
+        psi.Environment["CORECLR_ENABLE_PROFILING"] = "0";
+        psi.Environment["CORECLR_PROFILER_PATH_64"] = profilerDll;
         psi.Environment["RESHARPER_PROFILER_PIPE_NAME"] = pipeName;
 
         var process = Process.Start(psi);
@@ -221,10 +231,10 @@ static class Program
                 return null;
             }
 
-            Console.WriteLine("Profiler connected.");
+            Console.WriteLine("Profiler connected (devenv).");
 
             process.WaitForExit();
-            server!.Dispose();
+            DisposeAllServers();
             return new RunResult(0, _totalFreezeTime, _maxFreezeTime, 0);
         }
 
@@ -259,7 +269,7 @@ static class Program
                     return;
                 }
 
-                WriteStep("Profiler connected", true);
+                WriteStep("Profiler connected (devenv)", true);
 
                 ctx.Status("Waiting for solution listener...");
                 WaitForAny(SolutionListenerReady, process);
@@ -298,18 +308,57 @@ static class Program
 
         if (!startupOk)
         {
-            server?.Dispose();
+            DisposeAllServers();
             return null;
         }
 
         if (ungracefulExit)
         {
-            server?.Dispose();
+            DisposeAllServers();
             return null;
         }
 
-        server!.Dispose();
+        DisposeAllServers();
         return new RunResult(totalTime, _totalFreezeTime, _maxFreezeTime, closeTime);
+    }
+
+    static void AcceptBackendConnection(string pipeName)
+    {
+        new Thread(() =>
+        {
+            try
+            {
+                var backend = new Server(pipeName);
+                backend.MessageReceived += OnMessageReceived;
+                backend.Error += (context, ex) => Console.Error.WriteLine($"[PIPE ERROR] backend: {context}: {ex}");
+                backend.Disconnected += () =>
+                {
+                    if (_debug || !SolutionLoaded.IsSet)
+                        Console.Error.WriteLine("[PIPE] backend disconnected");
+                };
+                backend.Start();
+                Servers.Add(backend);
+
+                if (_debug)
+                    Console.WriteLine("Backend profiler connected.");
+                else
+                    WriteStep("Profiler connected (backend)", true);
+            }
+            catch (Exception ex)
+            {
+                // Backend may never connect if OOP is not enabled - this is expected
+                if (_debug)
+                    Console.WriteLine($"Backend pipe server ended: {ex.Message}");
+            }
+        })
+        { IsBackground = true, Name = "BackendPipeServer" }.Start();
+    }
+
+    static void DisposeAllServers()
+    {
+        foreach (var s in Servers)
+            s.Dispose();
+        Servers.Clear();
     }
 
     static void PrintSummary(List<RunResult> results, TimeSpan totalDuration)
@@ -396,48 +445,45 @@ static class Program
         rows.Add(new Markup("  [bold]Typing Latency Test[/] - type in the editor"));
         rows.Add(new Text(""));
 
-        lock (LatencyLock)
+        if (Latencies.Count == 0)
         {
-            if (Latencies.Count == 0)
+            rows.Add(new Markup("  [dim]Waiting for keystrokes...[/]"));
+        }
+        else
+        {
+            var sorted = Latencies.OrderBy(x => x).ToList();
+            var count = sorted.Count;
+            var avg = sorted.Average();
+            var median = Percentile(sorted, 50);
+            var p95 = Percentile(sorted, 95);
+            var max = sorted[^1];
+
+            rows.Add(new Markup(
+                $"  Keys: [bold]{count}[/]   " +
+                $"Avg: [bold]{avg:F1}[/] ms   " +
+                $"Median: [bold]{median:F1}[/] ms   " +
+                $"P95: [bold]{p95:F1}[/] ms   " +
+                $"Max: [bold]{max:F1}[/] ms"));
+            rows.Add(new Text(""));
+
+            var buckets = new (string Label, double Min, double Max, Color Color)[]
             {
-                rows.Add(new Markup("  [dim]Waiting for keystrokes...[/]"));
-            }
-            else
+                ("  0-10 ms", 0, 10, Color.Green),
+                (" 10-25 ms", 10, 25, Color.Green),
+                (" 25-50 ms", 25, 50, Color.Yellow),
+                ("50-100 ms", 50, 100, Color.Red),
+                ("  >100 ms", 100, double.MaxValue, Color.Red),
+            };
+
+            var chart = new BarChart().Width(60);
+
+            foreach (var (label, min, max2, color) in buckets)
             {
-                var sorted = Latencies.OrderBy(x => x).ToList();
-                var count = sorted.Count;
-                var avg = sorted.Average();
-                var median = Percentile(sorted, 50);
-                var p95 = Percentile(sorted, 95);
-                var max = sorted[^1];
-
-                rows.Add(new Markup(
-                    $"  Keys: [bold]{count}[/]   " +
-                    $"Avg: [bold]{avg:F1}[/] ms   " +
-                    $"Median: [bold]{median:F1}[/] ms   " +
-                    $"P95: [bold]{p95:F1}[/] ms   " +
-                    $"Max: [bold]{max:F1}[/] ms"));
-                rows.Add(new Text(""));
-
-                var buckets = new (string Label, double Min, double Max, Color Color)[]
-                {
-                    ("  0-10 ms", 0, 10, Color.Green),
-                    (" 10-25 ms", 10, 25, Color.Green),
-                    (" 25-50 ms", 25, 50, Color.Yellow),
-                    ("50-100 ms", 50, 100, Color.Red),
-                    ("  >100 ms", 100, double.MaxValue, Color.Red),
-                };
-
-                var chart = new BarChart().Width(60);
-
-                foreach (var (label, min, max2, color) in buckets)
-                {
-                    var bucketCount = sorted.Count(x => x >= min && x < max2);
-                    chart.AddItem(label, bucketCount, color);
-                }
-
-                rows.Add(chart);
+                var bucketCount = sorted.Count(x => x >= min && x < max2);
+                chart.AddItem(label, bucketCount, color);
             }
+
+            rows.Add(chart);
         }
 
         return new Rows(rows);
@@ -540,10 +586,7 @@ static class Program
                 if (_debug)
                     Console.WriteLine($"[{timestamp}] Typing latency: {latencyUs / 1000.0:F1} ms");
 
-                lock (LatencyLock)
-                {
-                    Latencies.Add(latencyUs / 1000.0);
-                }
+                Latencies.Enqueue(latencyUs / 1000.0);
 
                 break;
             }
