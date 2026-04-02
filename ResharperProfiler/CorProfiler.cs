@@ -1,4 +1,5 @@
 ﻿using System.Collections.Concurrent;
+using System.ComponentModel;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using dnlib.DotNet;
@@ -44,7 +45,7 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
 
         Log.Write($"Profiler loaded (process: {processName}, isBackend: {_isBackend})");
 
-        // Disable profiling for child processes (unless OOP backend which inherits env vars)
+        // Disable profiling for child processes (OOP backend gets re-enabled via InvokeCore hook)
         if (!_isBackend)
         {
             Environment.SetEnvironmentVariable("COR_ENABLE_PROFILING", "0");
@@ -153,14 +154,14 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
             return result;
         }
 
-        if (!_isBackend && "JetBrains.Platform.VisualStudio.Core".Equals(fileName, StringComparison.OrdinalIgnoreCase))
+        if (!_isBackend && "JetBrains.Platform.Util".Equals(fileName, StringComparison.OrdinalIgnoreCase))
         {
-            Log.Write($"VS Core module loaded (id: {moduleId.Value:x2}), hooking OOP detection");
-            var result = HookMethod(moduleId, "JetBrains.VsIntegration.BackendInterop.BackendEntry", "CreateBackend", &OnOopDetectedCallback, instrumentMethodStart: true);
+            Log.Write($"Platform.Util module loaded (id: {moduleId.Value:x2}), hooking InvokeCore for backend profiler injection");
+            var result = HookInvokeCore(moduleId);
 
             if (!result)
             {
-                Log.Write($"Failed to hook OOP detection: {result}");
+                Log.Write($"Failed to hook InvokeCore: {result}");
             }
 
             return HResult.S_OK;
@@ -180,8 +181,6 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
     [UnmanagedCallersOnly]
     private static void OnDaemonFinishedCallback(IntPtr instance) => CallProfiler(instance, profiler => profiler.OnDaemonFinished());
 
-    [UnmanagedCallersOnly]
-    private static void OnOopDetectedCallback(IntPtr instance) => CallProfiler(instance, profiler => profiler.OnOopDetected());
 
     private static void CallProfiler(IntPtr instance, Action<CorProfiler> action)
     {
@@ -229,14 +228,95 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
         _pipeClient?.ReportPhase(Phase.DaemonFinished);
     }
 
-    private void OnOopDetected()
+    private HResult HookInvokeCore(ModuleId moduleId)
     {
-        Log.Write("ReSharper is running out-of-process, enabling profiler for backend process");
-        Environment.SetEnvironmentVariable("CORECLR_ENABLE_PROFILING", "1");
-        Environment.SetEnvironmentVariable("CORECLR_PROFILER", "{687FB688-F002-4B64-9A95-567E5502230F}");
-        Environment.SetEnvironmentVariable("CORECLR_PROFILER_PATH_64",
-            Environment.GetEnvironmentVariable("COR_PROFILER_PATH_64"));
+        try
+        {
+            using var metaDataImport = ICorProfilerInfo.GetModuleMetaDataImport2(moduleId, CorOpenFlags.ofRead)
+                .ThrowIfFailed("Failed to get IMetaDataImport2")
+                .Wrap();
+
+            var invokeTypeDef = metaDataImport.Value.FindTypeDefByName("JetBrains.Util.InvokeChildProcess", default)
+                .ThrowIfFailed("Failed to find InvokeChildProcess type");
+
+            var invokeCoreMethod = metaDataImport.Value.FindMethod(invokeTypeDef, "InvokeCore", default)
+                .ThrowIfFailed("Failed to find InvokeCore method");
+
+            var ilRewriter = Silhouette.IL.IlRewriter.Create(ICorProfilerInfo3);
+            using var method = ilRewriter.Import(moduleId, invokeCoreMethod);
+
+
+            var startInfoTypeDef = metaDataImport.Value.FindTypeDefByName("StartInfo", invokeTypeDef.Token)
+                .ThrowIfFailed("Failed to find StartInfo");
+            var getTargetMethod = metaDataImport.Value.FindMethod(startInfoTypeDef, "get_Target", default)
+                .ThrowIfFailed("Failed to find get_Target");
+            var additionalEnvVarsField = metaDataImport.Value.FindField(startInfoTypeDef, "AdditionalEnvironmentVariables", default)
+                .ThrowIfFailed("Failed to find AdditionalEnvironmentVariables");
+
+            var getTargetOp = method.Metadata.ResolveMethod(getTargetMethod);
+            var envVarsFieldOp = method.Metadata.ResolveField(additionalEnvVarsField);
+
+            var corLib = method.Metadata.CorLibTypes;
+            var iDictTypeRef = corLib.GetTypeRef("System.Collections.Generic", "IDictionary`2");
+
+            // Create MemberRefs
+            var toStringOp = method.Metadata.GetMemberRef(corLib.Object.TypeDefOrRef, "ToString", MethodSig.CreateInstance(corLib.String));
+            var containsOp = method.Metadata.GetMemberRef(corLib.String.TypeDefOrRef, "Contains", MethodSig.CreateInstance(corLib.Boolean, corLib.String));
+            var getEnvVarOp = method.Metadata.GetMemberRef(corLib.GetTypeRef("System", "Environment"), "GetEnvironmentVariable", MethodSig.CreateStatic(corLib.String, corLib.String));
+
+            // Create TypeSpec for IDictionary<string, string> and its set_Item MemberRef
+            var iDictStringStringSpec = method.Metadata.GetTypeSpec(new GenericInstSig(new ClassSig(iDictTypeRef), corLib.String, corLib.String));
+            var setItemOp = method.Metadata.GetMemberRef(iDictStringStringSpec, "set_Item", MethodSig.CreateInstance(corLib.Void, new GenericVar(0), new GenericVar(1)));
+
+            // Target for the branch-skip: the original first instruction
+            var skipTarget = method.Body.Instructions[0];
+
+            int i = 0;
+
+            // if (!startInfo.Target.ToString().Contains("ReSharper.Backend")) goto skip;
+            method.Body.Instructions.Insert(i++, Instruction.Create(OpCodes.Ldarg_1));
+            method.Body.Instructions.Insert(i++, Instruction.Create(OpCodes.Callvirt, getTargetOp));
+            method.Body.Instructions.Insert(i++, Instruction.Create(OpCodes.Callvirt, toStringOp));
+            method.Body.Instructions.Insert(i++, Instruction.Create(OpCodes.Ldstr, "ReSharper.Backend"));
+            method.Body.Instructions.Insert(i++, Instruction.Create(OpCodes.Callvirt, containsOp));
+            method.Body.Instructions.Insert(i++, Instruction.Create(OpCodes.Brfalse, skipTarget));
+
+            // startInfo.AdditionalEnvironmentVariables["CORECLR_ENABLE_PROFILING"] = "1";
+            method.Body.Instructions.Insert(i++, Instruction.Create(OpCodes.Ldarg_1));
+            method.Body.Instructions.Insert(i++, Instruction.Create(OpCodes.Ldfld, envVarsFieldOp));
+            method.Body.Instructions.Insert(i++, Instruction.Create(OpCodes.Ldstr, "CORECLR_ENABLE_PROFILING"));
+            method.Body.Instructions.Insert(i++, Instruction.Create(OpCodes.Ldstr, "1"));
+            method.Body.Instructions.Insert(i++, Instruction.Create(OpCodes.Callvirt, setItemOp));
+
+            // startInfo.AdditionalEnvironmentVariables["CORECLR_PROFILER"] = "{687FB688-F002-4B64-9A95-567E5502230F}";
+            method.Body.Instructions.Insert(i++, Instruction.Create(OpCodes.Ldarg_1));
+            method.Body.Instructions.Insert(i++, Instruction.Create(OpCodes.Ldfld, envVarsFieldOp));
+            method.Body.Instructions.Insert(i++, Instruction.Create(OpCodes.Ldstr, "CORECLR_PROFILER"));
+            method.Body.Instructions.Insert(i++, Instruction.Create(OpCodes.Ldstr, "{687FB688-F002-4B64-9A95-567E5502230F}"));
+            method.Body.Instructions.Insert(i++, Instruction.Create(OpCodes.Callvirt, setItemOp));
+
+            // startInfo.AdditionalEnvironmentVariables["CORECLR_PROFILER_PATH_64"] = Environment.GetEnvironmentVariable("COR_PROFILER_PATH_64");
+            method.Body.Instructions.Insert(i++, Instruction.Create(OpCodes.Ldarg_1));
+            method.Body.Instructions.Insert(i++, Instruction.Create(OpCodes.Ldfld, envVarsFieldOp));
+            method.Body.Instructions.Insert(i++, Instruction.Create(OpCodes.Ldstr, "CORECLR_PROFILER_PATH_64"));
+            method.Body.Instructions.Insert(i++, Instruction.Create(OpCodes.Ldstr, "COR_PROFILER_PATH_64"));
+            method.Body.Instructions.Insert(i++, Instruction.Create(OpCodes.Call, getEnvVarOp));
+            method.Body.Instructions.Insert(i++, Instruction.Create(OpCodes.Callvirt, setItemOp));
+
+            method.Body.UpdateInstructionOffsets();
+
+            ilRewriter.Export(method);
+
+            Log.Write($"Successfully hooked InvokeCore ({i} instructions injected)");
+            return HResult.S_OK;
+        }
+        catch (Exception ex)
+        {
+            Log.Write($"Failed to rewrite InvokeCore method: {ex}");
+            return HResult.E_FAIL;
+        }
     }
+
 
     private static Client? CreatePipeClient()
     {
