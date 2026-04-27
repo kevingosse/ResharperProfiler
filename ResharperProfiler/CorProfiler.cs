@@ -70,8 +70,10 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
         _mainThreadId = NativeMethods.GetCurrentThreadId();
         _thisHandle = GCHandle.Alloc(this);
 
+        var noFreezes = Environment.GetEnvironmentVariable("RESHARPER_PROFILER_NO_FREEZES") == "1";
+
         // Input sending and UI freeze monitoring only apply to devenv.exe
-        if (!_isBackend)
+        if (!_isBackend && !noFreezes)
         {
             new Thread(LowLevelHookThread)
             {
