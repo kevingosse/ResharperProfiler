@@ -4,6 +4,8 @@ public enum Phase : byte
 {
     Startup,
     SolutionListenerReady,
-    SaveCaches,
-    DaemonFinished
+    SolutionLoaded,
+    DaemonFinished,
+    LateLoadTask,
+    DaemonStarted
 }

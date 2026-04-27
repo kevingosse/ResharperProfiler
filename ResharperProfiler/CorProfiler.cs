@@ -24,6 +24,10 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
     private GCHandle _thisHandle;
     private readonly ConcurrentQueue<long> _keyTimestamps = new();
     private bool _isBackend;
+    private volatile bool _lateLoadTaskFired;
+    private volatile bool _daemonEverStarted;
+    private volatile bool _daemonFinishedSeen;
+    private int _solutionLoadedReported;
 
     protected override HResult Initialize(int iCorProfilerInfoVersion)
     {
@@ -126,26 +130,63 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
         {
             Log.Write($"Feature services module loaded (id: {moduleId.Value:x2}), hooking daemon ready");
 
-            var result = HookMethod(moduleId, "JetBrains.ReSharper.Feature.Services.Daemon.DaemonPerformanceCollector", "RegisterDaemonFinished", &OnDaemonFinishedCallback, instrumentMethodStart: true);
+            var daemonHookResult = HookMethod(moduleId, "JetBrains.ReSharper.Feature.Services.Daemon.DaemonPerformanceCollector", "RegisterDaemonFinished", &OnDaemonFinishedCallback, instrumentMethodStart: true);
 
-            if (!result)
+            if (!daemonHookResult)
             {
-                Log.Write($"Failed to hook daemon ready: {result}");
-                _pipeClient?.ReportPhase(Phase.DaemonFinished, success: false, statusMessage: $"Failed to hook DaemonFinished method: {result}");
+                Log.Write($"Failed to hook daemon ready: {daemonHookResult}");
+                _pipeClient?.ReportPhase(Phase.DaemonFinished, success: false, statusMessage: $"Failed to hook DaemonFinished method: {daemonHookResult}");
             }
 
-            return result;
+            return daemonHookResult;
         }
 
-        if ("JetBrains.ReSharper.Psi".Equals(fileName, StringComparison.OrdinalIgnoreCase))
+        if ("JetBrains.ReSharper.Daemon".Equals(fileName, StringComparison.OrdinalIgnoreCase))
         {
-            Log.Write($"ProjectModel module loaded (id: {moduleId.Value:x2}), hooking report phase");
-            var result = HookMethod(moduleId, "JetBrains.ReSharper.Psi.Caches.Jobs.JobSaveCaches", "Do", &OnSaveCachesCallback, instrumentMethodStart: false);
+            Log.Write($"Daemon module loaded (id: {moduleId.Value:x2}), hooking daemon-process creation");
 
-            if (!result)
+            // `CreateDaemonForDocumentImpl` is the sole instantiation site for `VisibleDocumentDaemonProcess`.
+            // It only fires when ReSharper actually has a document to analyse. We use that as the
+            // "any daemon will run" signal: if `OnSolutionLoadAsLateAsPossible` fires and we never
+            // saw this hook fire, no document is open and there is nothing to wait for — fire
+            // SolutionLoaded immediately. Otherwise wait for `RegisterDaemonFinished`.
+            var startedHookResult = HookMethod(moduleId, "JetBrains.ReSharper.Daemon.Impl.DaemonImpl", "CreateDaemonForDocumentImpl", &OnDaemonStartedCallback, instrumentMethodStart: true);
+
+            if (!startedHookResult)
             {
-                Log.Write($"Failed to hook save caches: {result}");
-                _pipeClient?.ReportPhase(Phase.SaveCaches, success: false, statusMessage: $"Failed to hook SaveCaches method: {result}");
+                Log.Write($"Failed to hook DaemonImpl.CreateDaemonForDocumentImpl: {startedHookResult}");
+                _pipeClient?.ReportPhase(Phase.DaemonStarted, success: false, statusMessage: $"Failed to hook DaemonImpl.CreateDaemonForDocumentImpl: {startedHookResult}");
+            }
+
+            return startedHookResult;
+        }
+
+        if ("JetBrains.Platform.ProjectModel".Equals(fileName, StringComparison.OrdinalIgnoreCase))
+        {
+            Log.Write($"ProjectModel module loaded (id: {moduleId.Value:x2}), hooking solution-load completion");
+
+            // Master: SolutionLoadListenersManager2 in JetBrains.ProjectModel.Tasks.Listeners.
+            // 2025.1 baseline: SolutionLoadListenersManager in JetBrains.ProjectModel.Tasks (the v2 class doesn't exist yet,
+            // and the v1 class is [Obsolete(error: true)] in master so it's never instantiated there).
+            var result = HookMethod(moduleId, "JetBrains.ProjectModel.Tasks.Listeners.SolutionLoadListenersManager2", "OnSolutionLoadAsLateAsPossible", &OnLateLoadTaskCallback, instrumentMethodStart: true);
+
+            if (result)
+            {
+                Log.Write("Hooked SolutionLoadListenersManager2.OnSolutionLoadAsLateAsPossible (master)");
+            }
+            else
+            {
+                result = HookMethod(moduleId, "JetBrains.ProjectModel.Tasks.SolutionLoadListenersManager", "OnSolutionLoadAsLateAsPossible", &OnLateLoadTaskCallback, instrumentMethodStart: true);
+
+                if (result)
+                {
+                    Log.Write("Hooked SolutionLoadListenersManager.OnSolutionLoadAsLateAsPossible (2025.1 baseline)");
+                }
+                else
+                {
+                    Log.Write($"Failed to hook solution-load completion (tried v2 then v1): {result}");
+                    _pipeClient?.ReportPhase(Phase.LateLoadTask, success: false, statusMessage: $"Failed to hook OnSolutionLoadAsLateAsPossible method: {result}");
+                }
             }
 
             if (!_isBackend)
@@ -170,17 +211,17 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
         return HResult.S_OK;
     }
 
-
-
     [UnmanagedCallersOnly]
     private static void OnStartupCallback(IntPtr instance) => CallProfiler(instance, profiler => profiler.OnStartup());
 
     [UnmanagedCallersOnly]
-    private static void OnSaveCachesCallback(IntPtr instance) => CallProfiler(instance, profiler => profiler.OnSaveCaches());
+    private static void OnLateLoadTaskCallback(IntPtr instance) => CallProfiler(instance, profiler => profiler.OnLateLoadTask());
 
     [UnmanagedCallersOnly]
     private static void OnDaemonFinishedCallback(IntPtr instance) => CallProfiler(instance, profiler => profiler.OnDaemonFinished());
 
+    [UnmanagedCallersOnly]
+    private static void OnDaemonStartedCallback(IntPtr instance) => CallProfiler(instance, profiler => profiler.OnDaemonStarted());
 
     private static void CallProfiler(IntPtr instance, Action<CorProfiler> action)
     {
@@ -210,12 +251,25 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
         Log.Write("Resharper startup detected");
     }
 
-    private void OnSaveCaches()
+    private void OnLateLoadTask()
     {
-        _pipeClient?.ReportPhase(Phase.SaveCaches);
+        _pipeClient?.ReportPhase(Phase.LateLoadTask);
+        Log.Write("Late load task fired (OnSolutionLoadAsLateAsPossible)");
 
-        _solutionLoaded.Cancel();
-        Log.Write($"Total input events sent: {_sentInput}, received: {_receivedInput}");
+        _lateLoadTaskFired = true;
+        TryFireSolutionLoaded();
+    }
+
+    private void OnDaemonStarted()
+    {
+        // Reports once for visibility, then keeps tracking silently — only the very first
+        // `CreateDaemonForDocumentImpl` matters for the gate: it tells us at least one
+        // document is being analysed, so a `RegisterDaemonFinished` will eventually fire.
+        if (!_daemonEverStarted)
+        {
+            _daemonEverStarted = true;
+            _pipeClient?.ReportPhase(Phase.DaemonStarted);
+        }
     }
 
     private void OnDaemonFinished()
@@ -226,6 +280,38 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
         }
 
         _pipeClient?.ReportPhase(Phase.DaemonFinished);
+        _daemonFinishedSeen = true;
+        TryFireSolutionLoaded();
+    }
+
+    /// <summary>
+    /// Fires <see cref="Phase.SolutionLoaded"/> when the gate conditions are satisfied:
+    /// <list type="bullet">
+    ///   <item>The late-load task has fired (project model is fully loaded).</item>
+    ///   <item>Either a daemon was scheduled and has since finished, OR no daemon ever
+    ///         scheduled (no document open → nothing to analyse → already settled).</item>
+    /// </list>
+    /// </summary>
+    private void TryFireSolutionLoaded()
+    {
+        if (!_lateLoadTaskFired)
+        {
+            return;
+        }
+
+        if (_daemonEverStarted && !_daemonFinishedSeen)
+        {
+            return;
+        }
+
+        if (Interlocked.CompareExchange(ref _solutionLoadedReported, 1, 0) != 0)
+        {
+            return;
+        }
+
+        _pipeClient?.ReportPhase(Phase.SolutionLoaded);
+        _solutionLoaded.Cancel();
+        Log.Write($"Solution fully loaded (daemonEverStarted={_daemonEverStarted}). Total input events sent: {_sentInput}, received: {_receivedInput}");
     }
 
     private HResult HookInvokeCore(ModuleId moduleId)
@@ -244,7 +330,6 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
 
             var ilRewriter = Silhouette.IL.IlRewriter.Create(ICorProfilerInfo3);
             using var method = ilRewriter.Import(moduleId, invokeCoreMethod);
-
 
             var startInfoTypeDef = metaDataImport.Value.FindTypeDefByName("StartInfo", invokeTypeDef.Token)
                 .ThrowIfFailed("Failed to find StartInfo");
@@ -316,7 +401,6 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
             return HResult.E_FAIL;
         }
     }
-
 
     private static Client? CreatePipeClient()
     {
@@ -443,7 +527,6 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
         try
         {
             var inputs = new NativeMethods.INPUT[2];
-
             var inputSize = Marshal.SizeOf<NativeMethods.INPUT>();
 
             while (!_shutdownToken.IsCancellationRequested)

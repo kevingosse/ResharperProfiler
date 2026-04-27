@@ -21,6 +21,9 @@ static class Program
 
     private static readonly ManualResetEventSlim SolutionListenerReady = new();
     private static readonly ManualResetEventSlim SolutionLoaded = new();
+    private static int _lateLoadTaskAnnounced;
+    private static int _daemonFinishedAnnounced;
+    private static int _daemonStartedAnnounced;
 
     private static readonly ConcurrentQueue<double> Latencies = new(); // in ms
     private static readonly List<Server> Servers = new();
@@ -147,6 +150,9 @@ static class Program
         _maxFreezeTime = 0;
         SolutionListenerReady.Reset();
         SolutionLoaded.Reset();
+        _lateLoadTaskAnnounced = 0;
+        _daemonFinishedAnnounced = 0;
+        _daemonStartedAnnounced = 0;
         Latencies.Clear();
         Servers.Clear();
 
@@ -556,7 +562,19 @@ static class Program
                     case Phase.SolutionListenerReady:
                         SolutionListenerReady.Set();
                         break;
-                    case Phase.SaveCaches:
+                    case Phase.LateLoadTask:
+                        if (Interlocked.CompareExchange(ref _lateLoadTaskAnnounced, 1, 0) == 0)
+                            WriteStep("Project model loaded", true);
+                        break;
+                    case Phase.DaemonStarted:
+                        if (Interlocked.CompareExchange(ref _daemonStartedAnnounced, 1, 0) == 0)
+                            WriteStep("Daemon scheduled (first document)", true);
+                        break;
+                    case Phase.DaemonFinished:
+                        if (Interlocked.CompareExchange(ref _daemonFinishedAnnounced, 1, 0) == 0)
+                            WriteStep("Daemon finished (first file)", true);
+                        break;
+                    case Phase.SolutionLoaded:
                         SolutionLoaded.Set();
                         break;
                 }
