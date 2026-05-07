@@ -259,7 +259,16 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
         Log.Write("Late load task fired (OnSolutionLoadAsLateAsPossible)");
 
         _lateLoadTaskFired = true;
-        TryFireSolutionLoaded();
+
+        if (TryFireSolutionLoaded())
+        {
+            return;
+        }
+
+        // If no daemon has appeared shortly after late-load, treat project-model load as
+        // the end of startup. A daemon that starts before this timeout keeps the normal
+        // "wait for daemon finished" path.
+        Task.Delay(2000).ContinueWith(_ => TryFireSolutionLoaded(allowNoDaemonFallback: true));
     }
 
     private void OnDaemonStarted()
@@ -294,26 +303,35 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
     ///         scheduled (no document open → nothing to analyse → already settled).</item>
     /// </list>
     /// </summary>
-    private void TryFireSolutionLoaded()
+    private bool TryFireSolutionLoaded(bool allowNoDaemonFallback = false)
     {
         if (!_lateLoadTaskFired)
         {
-            return;
+            return false;
         }
 
-        if (_daemonEverStarted && !_daemonFinishedSeen)
+        if (_daemonFinishedSeen)
         {
-            return;
+            // The daemon gate is satisfied. This can happen before late-load.
+        }
+        else if (_daemonEverStarted)
+        {
+            return false;
+        }
+        else if (!allowNoDaemonFallback)
+        {
+            return false;
         }
 
         if (Interlocked.CompareExchange(ref _solutionLoadedReported, 1, 0) != 0)
         {
-            return;
+            return false;
         }
 
         _pipeClient?.ReportPhase(Phase.SolutionLoaded);
         _solutionLoaded.Cancel();
-        Log.Write($"Solution fully loaded (daemonEverStarted={_daemonEverStarted}). Total input events sent: {_sentInput}, received: {_receivedInput}");
+        Log.Write($"Solution fully loaded (daemonEverStarted={_daemonEverStarted}, daemonFinishedSeen={_daemonFinishedSeen}, allowNoDaemonFallback={allowNoDaemonFallback}). Total input events sent: {_sentInput}, received: {_receivedInput}");
+        return true;
     }
 
     private HResult HookInvokeCore(ModuleId moduleId)

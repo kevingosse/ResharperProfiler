@@ -21,6 +21,9 @@ static class Program
 
     private static readonly ManualResetEventSlim SolutionListenerReady = new();
     private static readonly ManualResetEventSlim SolutionLoaded = new();
+    private static volatile bool _backendConnected;
+    private static long _backendLateLoadTime;
+    private static volatile bool _backendDaemonSeen;
     private static int _lateLoadTaskAnnounced;
     private static int _daemonFinishedAnnounced;
     private static int _daemonStartedAnnounced;
@@ -171,6 +174,9 @@ static class Program
         _maxFreezeTime = 0;
         SolutionListenerReady.Reset();
         SolutionLoaded.Reset();
+        _backendConnected = false;
+        Interlocked.Exchange(ref _backendLateLoadTime, 0);
+        _backendDaemonSeen = false;
         _lateLoadTaskAnnounced = 0;
         _daemonFinishedAnnounced = 0;
         _daemonStartedAnnounced = 0;
@@ -189,7 +195,7 @@ static class Program
             try
             {
                 server = new Server(pipeName);
-                server.MessageReceived += OnMessageReceived;
+                server.MessageReceived += (ts, type, payload) => OnMessageReceived(ts, type, payload, isBackend: false);
                 server.Error += (context, ex) => Console.Error.WriteLine($"[PIPE ERROR] devenv: {context}: {ex}");
                 server.Disconnected += () =>
                 {
@@ -314,7 +320,10 @@ static class Program
                     return;
                 }
 
-                totalTime = Environment.TickCount64 - _startupTime;
+                var backendLlt = Interlocked.Read(ref _backendLateLoadTime);
+                totalTime = (_backendConnected && backendLlt > 0 && !_backendDaemonSeen)
+                    ? backendLlt - _startupTime
+                    : Environment.TickCount64 - _startupTime;
                 var freezeLine = noFreezes
                     ? "           Total UI freeze: [yellow]disabled (--no-freezes)[/]"
                     : $"           Total UI freeze: [bold]{_totalFreezeTime}[/] ms (max: [bold]{_maxFreezeTime}[/] ms)";
@@ -361,7 +370,8 @@ static class Program
             try
             {
                 var backend = new Server(pipeName);
-                backend.MessageReceived += OnMessageReceived;
+                _backendConnected = true;
+                backend.MessageReceived += (ts, type, payload) => OnMessageReceived(ts, type, payload, isBackend: true);
                 backend.Error += (context, ex) => Console.Error.WriteLine($"[PIPE ERROR] backend: {context}: {ex}");
                 backend.Disconnected += () =>
                 {
@@ -573,7 +583,7 @@ static class Program
         }, IntPtr.Zero);
     }
 
-    static void OnMessageReceived(long timestamp, MessageType type, byte[] payload)
+    static void OnMessageReceived(long timestamp, MessageType type, byte[] payload, bool isBackend)
     {
         switch (type)
         {
@@ -602,25 +612,31 @@ static class Program
                     WriteStep($"{phase}{detail}", false);
                     break;
                 }
+                var source = isBackend ? " (backend)" : "";
                 switch (phase)
                 {
                     case Phase.SolutionListenerReady:
                         SolutionListenerReady.Set();
                         break;
                     case Phase.LateLoadTask:
+                        if (isBackend)
+                            Interlocked.CompareExchange(ref _backendLateLoadTime, Environment.TickCount64, 0);
                         if (Interlocked.CompareExchange(ref _lateLoadTaskAnnounced, 1, 0) == 0)
-                            WriteStep("Project model loaded", true);
+                            WriteStep($"Project model loaded{source}", true);
                         break;
                     case Phase.DaemonStarted:
+                        if (isBackend)
+                            _backendDaemonSeen = true;
                         if (Interlocked.CompareExchange(ref _daemonStartedAnnounced, 1, 0) == 0)
-                            WriteStep("Daemon scheduled (first document)", true);
+                            WriteStep($"Daemon scheduled (first document){source}", true);
                         break;
                     case Phase.DaemonFinished:
                         if (Interlocked.CompareExchange(ref _daemonFinishedAnnounced, 1, 0) == 0)
-                            WriteStep("Daemon finished (first file)", true);
+                            WriteStep($"Daemon finished (first file){source}", true);
                         break;
                     case Phase.SolutionLoaded:
-                        SolutionLoaded.Set();
+                        if (isBackend || !_backendConnected)
+                            SolutionLoaded.Set();
                         break;
                 }
                 break;
@@ -630,10 +646,14 @@ static class Program
             {
                 using var reader = new BinaryReader(new MemoryStream(payload));
                 var duration = reader.ReadInt64();
-                _totalFreezeTime += duration;
 
-                if (duration > _maxFreezeTime)
-                    _maxFreezeTime = duration;
+                if (!SolutionLoaded.IsSet)
+                {
+                    _totalFreezeTime += duration;
+
+                    if (duration > _maxFreezeTime)
+                        _maxFreezeTime = duration;
+                }
 
                 if (_debug)
                     Console.WriteLine($"[{timestamp}] UI freeze: {duration} ms");
