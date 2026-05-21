@@ -71,6 +71,16 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
         _thisHandle = GCHandle.Alloc(this);
 
         var noFreezes = Environment.GetEnvironmentVariable("RESHARPER_PROFILER_NO_FREEZES") == "1";
+        var forceFocus = Environment.GetEnvironmentVariable("RESHARPER_PROFILER_FORCE_FOCUS") == "1";
+
+        if (!_isBackend && forceFocus)
+        {
+            new Thread(ForceFocusThread)
+            {
+                IsBackground = true,
+                Name = "UI Profiler Force Focus"
+            }.Start();
+        }
 
         // Input sending and UI freeze monitoring only apply to devenv.exe
         if (!_isBackend && !noFreezes)
@@ -671,6 +681,108 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
             }
 
             Thread.Sleep(100);
+        }
+    }
+
+    private void ForceFocusThread()
+    {
+        try
+        {
+            Log.Write("Force-focus monitor started");
+
+            while (!_shutdownToken.IsCancellationRequested)
+            {
+                Thread.Sleep(100);
+
+                var mainWindow = GetMainWindowHandle();
+
+                if (mainWindow == IntPtr.Zero)
+                {
+                    continue;
+                }
+
+                var foreground = NativeMethods.GetForegroundWindow();
+
+                if (foreground == mainWindow)
+                {
+                    continue;
+                }
+
+                if (foreground != IntPtr.Zero)
+                {
+                    NativeMethods.GetWindowThreadProcessId(foreground, out var pid);
+
+                    if (pid != Environment.ProcessId)
+                    {
+                        FocusWindow(mainWindow, foreground);
+                    }
+                }
+                else
+                {
+                    FocusWindow(mainWindow, IntPtr.Zero);
+                }
+
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Write($"ForceFocusThread failed: {ex}");
+        }
+    }
+
+    private static IntPtr GetMainWindowHandle()
+    {
+        using var process = Process.GetCurrentProcess();
+        process.Refresh();
+
+        if (process.MainWindowHandle != IntPtr.Zero)
+        {
+            return process.MainWindowHandle;
+        }
+
+        IntPtr result = IntPtr.Zero;
+
+        NativeMethods.EnumWindows((hWnd, _) =>
+        {
+            NativeMethods.GetWindowThreadProcessId(hWnd, out var pid);
+
+            if (pid == Environment.ProcessId && NativeMethods.IsWindowVisible(hWnd) && NativeMethods.GetWindow(hWnd, 4 /* GW_OWNER */) == IntPtr.Zero)
+            {
+                result = hWnd;
+                return false;
+            }
+
+            return true;
+        }, IntPtr.Zero);
+
+        return result;
+    }
+
+    private static void FocusWindow(IntPtr window, IntPtr foreground)
+    {
+        if (NativeMethods.IsIconic(window))
+        {
+            NativeMethods.ShowWindowAsync(window, 9 /* SW_RESTORE */);
+        }
+
+        var currentThread = NativeMethods.GetCurrentThreadId();
+        var foregroundThread = foreground == IntPtr.Zero
+            ? 0
+            : NativeMethods.GetWindowThreadProcessId(foreground, out _);
+
+        var attached = foregroundThread != 0 && foregroundThread != currentThread &&
+                       NativeMethods.AttachThreadInput(currentThread, foregroundThread, true);
+
+        try
+        {
+            NativeMethods.SetForegroundWindow(window);
+        }
+        finally
+        {
+            if (attached)
+            {
+                NativeMethods.AttachThreadInput(currentThread, foregroundThread, false);
+            }
         }
     }
 }

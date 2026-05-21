@@ -40,6 +40,7 @@ static class Program
         int runs = 1;
         int shutdownTimeoutSeconds = 60;
         bool noFreezes = false;
+        bool forceFocus = false;
 
         var i = 0;
         for (; i < args.Length; i++)
@@ -80,6 +81,9 @@ static class Program
                 case "--no-freezes":
                     noFreezes = true;
                     break;
+                case "--force-focus":
+                    forceFocus = true;
+                    break;
                 case "--":
                     i++;
                     goto done;
@@ -95,7 +99,7 @@ static class Program
         {
             Console.Error.WriteLine("Usage: ResharperProfiler.ConsoleLauncher [options] -- <executable> [args...]");
             Console.Error.WriteLine("Options: --debug, --output <path>, --benchmark-output <path>, --product-version <ver>,");
-            Console.Error.WriteLine("         --date <yyyy-MM-dd>, --runs <n>, --timeout <seconds>, --no-freezes");
+            Console.Error.WriteLine("         --date <yyyy-MM-dd>, --runs <n>, --timeout <seconds>, --no-freezes, --force-focus");
             return 1;
         }
 
@@ -116,7 +120,7 @@ static class Program
             if (runs > 1)
                 AnsiConsole.MarkupLine($"\n[bold]═══ Run {run + 1}/{runs} ═══[/]\n");
 
-            var result = ExecuteRun(profilerDll, args, shutdownTimeoutSeconds, noFreezes);
+            var result = ExecuteRun(profilerDll, args, shutdownTimeoutSeconds, noFreezes, forceFocus);
 
             if (result is null)
                 return 1;
@@ -167,7 +171,7 @@ static class Program
         return 0;
     }
 
-    static RunResult? ExecuteRun(string profilerDll, string[] args, int shutdownTimeoutSeconds, bool noFreezes)
+    static RunResult? ExecuteRun(string profilerDll, string[] args, int shutdownTimeoutSeconds, bool noFreezes, bool forceFocus)
     {
         // Reset per-run state
         _totalFreezeTime = 0;
@@ -235,6 +239,8 @@ static class Program
         psi.Environment["RESHARPER_PROFILER_PIPE_NAME"] = pipeName;
         if (noFreezes)
             psi.Environment["RESHARPER_PROFILER_NO_FREEZES"] = "1";
+        if (forceFocus)
+            psi.Environment["RESHARPER_PROFILER_FORCE_FOCUS"] = "1";
 
         var process = Process.Start(psi);
 
