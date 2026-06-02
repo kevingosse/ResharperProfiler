@@ -23,6 +23,14 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
     private long _receivedInput;
     private GCHandle _thisHandle;
     private readonly ConcurrentQueue<long> _keyTimestamps = new();
+    private NativeMethods.HookProc? _lowLevelHookProc;
+    private NativeMethods.HookProc? _keyboardHookProc;
+    private IntPtr _lowLevelHook;
+    private IntPtr _keyboardHook;
+    private long _lowLevelHookEvents;
+    private long _keyboardHookEvents;
+    private long _sendInputFailures;
+    private long _mainWindowWaitIterations;
     private bool _isBackend;
     private volatile bool _lateLoadTaskFired;
     private volatile bool _daemonEverStarted;
@@ -72,9 +80,11 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
 
         var noFreezes = Environment.GetEnvironmentVariable("RESHARPER_PROFILER_NO_FREEZES") == "1";
         var forceFocus = Environment.GetEnvironmentVariable("RESHARPER_PROFILER_FORCE_FOCUS") == "1";
+        Log.Debug($"Profiler initialized: mainThreadId={_mainThreadId}, noFreezes={noFreezes}, forceFocus={forceFocus}, userInteractive={Environment.UserInteractive}, sessionId={Process.GetCurrentProcess().SessionId}, logFile={Environment.GetEnvironmentVariable("RESHARPER_PROFILER_LOG_FILE") ?? "<none>"}");
 
         if (!_isBackend && forceFocus)
         {
+            Log.Debug("Starting force-focus monitor thread");
             new Thread(ForceFocusThread)
             {
                 IsBackground = true,
@@ -85,6 +95,7 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
         // Input sending and UI freeze monitoring only apply to devenv.exe
         if (!_isBackend && !noFreezes)
         {
+            Log.Debug("Starting UI freeze detection threads");
             new Thread(LowLevelHookThread)
             {
                 IsBackground = true,
@@ -103,12 +114,17 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
                 Name = "UI Responsiveness Monitor"
             }.Start();
         }
+        else
+        {
+            Log.Debug($"UI freeze detection threads not started (isBackend={_isBackend}, noFreezes={noFreezes})");
+        }
 
         return HResult.S_OK;
     }
 
     protected override HResult Shutdown()
     {
+        Log.Debug($"Profiler shutdown requested. sentInput={_sentInput}, receivedInput={_receivedInput}, lowLevelHookEvents={_lowLevelHookEvents}, keyboardHookEvents={_keyboardHookEvents}, sendInputFailures={_sendInputFailures}, pendingKeyTimestamps={_keyTimestamps.Count}, lowLevelHook=0x{_lowLevelHook.ToInt64():x}, keyboardHook=0x{_keyboardHook.ToInt64():x}");
         _shutdownToken.Cancel();
         return HResult.S_OK;
     }
@@ -501,9 +517,11 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
 
     private void MonitoringThread()
     {
+        Log.Debug("MonitoringThread started");
         bool isResponsive = true;
 
         var stopwatch = Stopwatch.StartNew();
+        var lastIdleLog = Environment.TickCount64;
 
         while (!_shutdownToken.IsCancellationRequested)
         {
@@ -517,10 +535,16 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
                     stopwatch.Stop();
 
                     var freezeDuration = stopwatch.ElapsedMilliseconds;
+                    Log.Debug($"UI responsiveness restored after {freezeDuration} ms; pendingKeyTimestamps={_keyTimestamps.Count}, sentInput={_sentInput}, receivedInput={_receivedInput}, lowLevelHookEvents={_lowLevelHookEvents}, keyboardHookEvents={_keyboardHookEvents}");
 
                     if (freezeDuration >= 100)
                     {
-                        _pipeClient?.SendUIFreeze(stopwatch.ElapsedMilliseconds);
+                        _pipeClient?.SendUIFreeze(freezeDuration);
+                        Log.Debug($"Reported UI freeze: {freezeDuration} ms");
+                    }
+                    else
+                    {
+                        Log.Debug($"Ignored short unresponsive period: {freezeDuration} ms");
                     }
                 }
             }
@@ -531,17 +555,26 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
                     // No pending keys = idle, not frozen
                     if (_keyTimestamps.IsEmpty)
                     {
+                        var now = Environment.TickCount64;
+                        if (now - lastIdleLog >= 5000)
+                        {
+                            lastIdleLog = now;
+                            Log.Debug($"MonitoringThread idle: no pending key timestamps; sentInput={_sentInput}, receivedInput={_receivedInput}, lowLevelHookEvents={_lowLevelHookEvents}, keyboardHookEvents={_keyboardHookEvents}, sendInputFailures={_sendInputFailures}");
+                        }
                         continue;
                     }
 
                     isResponsive = false;
                     stopwatch.Restart();
+                    Log.Debug($"UI responsiveness wait started; pendingKeyTimestamps={_keyTimestamps.Count}, sentInput={_sentInput}, receivedInput={_receivedInput}, lowLevelHookEvents={_lowLevelHookEvents}, keyboardHookEvents={_keyboardHookEvents}");
 
                     // Now wait indefinitely
                     _responsiveMutex.Wait(_shutdownToken.Token);
                 }
             }
         }
+
+        Log.Debug("MonitoringThread exiting");
     }
 
     private long _suspendUntilTicks;
@@ -550,7 +583,9 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
     {
         // Wait until Resharper modules are loaded before sending the fake inputs
         // Old versions of Resharper don't start loading until VS is idle, so sending inputs keeps them waiting forever
+        Log.Debug("InputThread started; waiting for startup signal before installing UI-thread hook and sending probe input");
         _solutionLoadMutex.Wait();
+        Log.Debug("InputThread startup signal received");
 
         SetHook((int)_mainThreadId);
 
@@ -558,6 +593,8 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
         {
             var inputs = new NativeMethods.INPUT[2];
             var inputSize = Marshal.SizeOf<NativeMethods.INPUT>();
+            var firstSuccessfulSendLogged = false;
+            var lastNoReceiveLog = Environment.TickCount64;
 
             while (!_shutdownToken.IsCancellationRequested)
             {
@@ -585,9 +622,32 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
                     type = type
                 };
 
-                NativeMethods.SendInput(2, inputs, inputSize);
+                var sent = NativeMethods.SendInput(2, inputs, inputSize);
 
-                _sentInput += 2;
+                if (sent != 2)
+                {
+                    var failures = Interlocked.Increment(ref _sendInputFailures);
+                    Log.Write($"SendInput failed or partially succeeded: sent={sent}, expected=2, lastWin32Error={Marshal.GetLastWin32Error()}, failures={failures}, foreground=0x{NativeMethods.GetForegroundWindow().ToInt64():x}");
+                    continue;
+                }
+
+                var totalSent = Interlocked.Add(ref _sentInput, 2);
+                if (!firstSuccessfulSendLogged)
+                {
+                    firstSuccessfulSendLogged = true;
+                    Log.Debug($"SendInput first success: totalSent={totalSent}, inputSize={inputSize}, foreground=0x{NativeMethods.GetForegroundWindow().ToInt64():x}");
+                }
+                else if (totalSent % 200 == 0)
+                {
+                    Log.Debug($"SendInput progress: totalSent={totalSent}, receivedInput={_receivedInput}, lowLevelHookEvents={_lowLevelHookEvents}, keyboardHookEvents={_keyboardHookEvents}, pendingKeyTimestamps={_keyTimestamps.Count}");
+                }
+
+                var now = Environment.TickCount64;
+                if (totalSent >= 20 && _receivedInput == 0 && now - lastNoReceiveLog >= 1000)
+                {
+                    lastNoReceiveLog = now;
+                    Log.Debug($"Probe input is being sent but no UI-thread hook events have been received yet: totalSent={totalSent}, lowLevelHookEvents={_lowLevelHookEvents}, keyboardHookEvents={_keyboardHookEvents}, pendingKeyTimestamps={_keyTimestamps.Count}");
+                }
             }
         }
         catch (Exception ex)
@@ -598,14 +658,18 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
 
     private void LowLevelHookThread()
     {
+        Log.Debug("LowLevelHookThread started");
         // LL hooks require hMod=0, dwThreadId=0 for global hook
-        var hook = NativeMethods.SetWindowsHookEx(NativeMethods.HookType.WH_KEYBOARD_LL, LowLevelHookProc, 0, 0);
+        _lowLevelHookProc = LowLevelHookProc;
+        _lowLevelHook = NativeMethods.SetWindowsHookEx(NativeMethods.HookType.WH_KEYBOARD_LL, _lowLevelHookProc!, 0, 0);
 
-        if (hook == IntPtr.Zero)
+        if (_lowLevelHook == IntPtr.Zero)
         {
             Log.Write($"Failed to install WH_KEYBOARD_LL hook: {Marshal.GetLastWin32Error()}");
             return;
         }
+
+        Log.Debug($"Installed WH_KEYBOARD_LL hook: handle=0x{_lowLevelHook.ToInt64():x}");
 
         // Message pump to keep the LL hook alive
         while (!_shutdownToken.IsCancellationRequested && NativeMethods.GetMessage(out var msg, IntPtr.Zero, 0, 0) > 0)
@@ -614,13 +678,20 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
             NativeMethods.DispatchMessage(ref msg);
         }
 
+        Log.Debug($"LowLevelHookThread exiting; lastWin32Error={Marshal.GetLastWin32Error()}, lowLevelHookEvents={_lowLevelHookEvents}");
+
         return;
 
         IntPtr LowLevelHookProc(int code, IntPtr wParam, IntPtr lParam)
         {
             if (code >= 0)
             {
+                var count = Interlocked.Increment(ref _lowLevelHookEvents);
                 _keyTimestamps.Enqueue(Stopwatch.GetTimestamp());
+                if (count == 1 || count % 200 == 0)
+                {
+                    Log.Debug($"WH_KEYBOARD_LL event: count={count}, code={code}, wParam=0x{wParam.ToInt64():x}, pendingKeyTimestamps={_keyTimestamps.Count}");
+                }
             }
 
             return NativeMethods.CallNextHookEx(0, code, wParam, lParam);
@@ -629,27 +700,47 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
 
     private void SetHook(int threadId)
     {
-        NativeMethods.SetWindowsHookEx(NativeMethods.HookType.WH_KEYBOARD, HookProc, 0, threadId);
+        _keyboardHookProc = HookProc;
+        _keyboardHook = NativeMethods.SetWindowsHookEx(NativeMethods.HookType.WH_KEYBOARD, _keyboardHookProc!, 0, threadId);
+
+        if (_keyboardHook == IntPtr.Zero)
+        {
+            Log.Write($"Failed to install WH_KEYBOARD hook for thread {threadId}: {Marshal.GetLastWin32Error()}");
+        }
+        else
+        {
+            Log.Debug($"Installed WH_KEYBOARD hook for thread {threadId}: handle=0x{_keyboardHook.ToInt64():x}");
+        }
 
         IntPtr HookProc(int code, IntPtr wParam, IntPtr lParam)
         {
             if (code >= 0)
             {
+                var hookEvents = Interlocked.Increment(ref _keyboardHookEvents);
                 var isProbeKey = (int)wParam == 0xFC;
 
                 if (isProbeKey)
                 {
-                    _receivedInput++;
+                    var received = Interlocked.Increment(ref _receivedInput);
+                    if (received == 1 || received % 200 == 0)
+                    {
+                        Log.Debug($"WH_KEYBOARD probe event: received={received}, hookEvents={hookEvents}, lParam=0x{lParam.ToInt64():x}, pendingKeyTimestamps={_keyTimestamps.Count}");
+                    }
                 }
                 else
                 {
                     Interlocked.Exchange(ref _suspendUntilTicks, Environment.TickCount64 + 3000);
+                    Log.Debug($"WH_KEYBOARD real key event: wParam=0x{wParam.ToInt64():x}, lParam=0x{lParam.ToInt64():x}; suspending probe input for 3000 ms");
                 }
 
                 // Dequeue the LL timestamp and signal responsiveness
                 if (_keyTimestamps.TryDequeue(out var llTimestamp))
                 {
                     _responsiveMutex.Set();
+                    if (hookEvents == 1 || hookEvents % 200 == 0)
+                    {
+                        Log.Debug($"Responsive signal set from WH_KEYBOARD event: hookEvents={hookEvents}, isProbeKey={isProbeKey}, pendingKeyTimestamps={_keyTimestamps.Count}");
+                    }
 
                     // Report typing latency for real key-down events after solution is loaded
                     if (!isProbeKey && _solutionLoaded.IsCancellationRequested && (int)lParam >= 0)
@@ -664,7 +755,7 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
         }
     }
 
-    private static void WaitForMainWindow()
+    private void WaitForMainWindow()
     {
         while (true)
         {
@@ -676,8 +767,24 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
 
                 if (pid == Environment.ProcessId)
                 {
+                    var waited = Interlocked.Exchange(ref _mainWindowWaitIterations, 0);
+                    if (waited > 0)
+                    {
+                        Log.Debug($"WaitForMainWindow succeeded after {waited} iterations; foreground=0x{foreground.ToInt64():x}");
+                    }
                     return;
                 }
+            }
+
+            var iterations = Interlocked.Increment(ref _mainWindowWaitIterations);
+            if (iterations == 1 || iterations % 50 == 0)
+            {
+                var mainWindow = GetMainWindowHandle();
+                var foregroundPid = 0u;
+                if (foreground != IntPtr.Zero)
+                    NativeMethods.GetWindowThreadProcessId(foreground, out foregroundPid);
+
+                Log.Debug($"WaitForMainWindow waiting: iterations={iterations}, foreground=0x{foreground.ToInt64():x}, foregroundPid={foregroundPid}, currentPid={Environment.ProcessId}, mainWindow=0x{mainWindow.ToInt64():x}");
             }
 
             Thread.Sleep(100);
@@ -688,7 +795,9 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
     {
         try
         {
-            Log.Write("Force-focus monitor started");
+            Log.Debug("Force-focus monitor started");
+            var missingWindowLogs = 0;
+            var focusAttempts = 0;
 
             while (!_shutdownToken.IsCancellationRequested)
             {
@@ -698,6 +807,11 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
 
                 if (mainWindow == IntPtr.Zero)
                 {
+                    missingWindowLogs++;
+                    if (missingWindowLogs == 1 || missingWindowLogs % 50 == 0)
+                    {
+                        Log.Debug($"Force-focus waiting for main window: attempts={missingWindowLogs}");
+                    }
                     continue;
                 }
 
@@ -714,11 +828,18 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
 
                     if (pid != Environment.ProcessId)
                     {
+                        focusAttempts++;
+                        if (focusAttempts == 1 || focusAttempts % 20 == 0)
+                        {
+                            Log.Debug($"Force-focus attempt {focusAttempts}: mainWindow=0x{mainWindow.ToInt64():x}, foreground=0x{foreground.ToInt64():x}, foregroundPid={pid}");
+                        }
                         FocusWindow(mainWindow, foreground);
                     }
                 }
                 else
                 {
+                    focusAttempts++;
+                    Log.Debug($"Force-focus attempt {focusAttempts}: no foreground window, mainWindow=0x{mainWindow.ToInt64():x}");
                     FocusWindow(mainWindow, IntPtr.Zero);
                 }
 
@@ -762,7 +883,8 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
     {
         if (NativeMethods.IsIconic(window))
         {
-            NativeMethods.ShowWindowAsync(window, 9 /* SW_RESTORE */);
+            var restored = NativeMethods.ShowWindowAsync(window, 9 /* SW_RESTORE */);
+            Log.Debug($"FocusWindow restored iconic window=0x{window.ToInt64():x}, result={restored}");
         }
 
         var currentThread = NativeMethods.GetCurrentThreadId();
@@ -772,16 +894,22 @@ public unsafe class CorProfiler : CorProfilerCallback9Base
 
         var attached = foregroundThread != 0 && foregroundThread != currentThread &&
                        NativeMethods.AttachThreadInput(currentThread, foregroundThread, true);
+        if (foregroundThread != 0 && foregroundThread != currentThread)
+        {
+            Log.Debug($"AttachThreadInput attach result={attached}, lastWin32Error={Marshal.GetLastWin32Error()}, currentThread={currentThread}, foregroundThread={foregroundThread}");
+        }
 
         try
         {
-            NativeMethods.SetForegroundWindow(window);
+            var result = NativeMethods.SetForegroundWindow(window);
+            Log.Debug($"SetForegroundWindow result={result}, lastWin32Error={Marshal.GetLastWin32Error()}, window=0x{window.ToInt64():x}, foreground=0x{foreground.ToInt64():x}, currentThread={currentThread}, foregroundThread={foregroundThread}, attached={attached}");
         }
         finally
         {
             if (attached)
             {
-                NativeMethods.AttachThreadInput(currentThread, foregroundThread, false);
+                var detached = NativeMethods.AttachThreadInput(currentThread, foregroundThread, false);
+                Log.Debug($"AttachThreadInput detach result={detached}, lastWin32Error={Marshal.GetLastWin32Error()}, currentThread={currentThread}, foregroundThread={foregroundThread}");
             }
         }
     }

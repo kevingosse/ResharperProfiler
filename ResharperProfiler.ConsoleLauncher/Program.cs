@@ -16,6 +16,10 @@ static class Program
     private static long _maxFreezeTime;
     private static long _startupTime;
     private static bool _debug;
+    private static string? _debugLogPath;
+    private static string? _debugLogRootPath;
+    private static bool _debugLogPathIsDirectory;
+    private static readonly object DebugLogLock = new();
 
     private record RunResult(long SolutionLoad, long TotalFreezeTime, long MaxFreezeTime, long CloseTime);
 
@@ -49,6 +53,9 @@ static class Program
             {
                 case "--debug":
                     _debug = true;
+                    break;
+                case "--debug-log":
+                    _debugLogPath = args[++i];
                     break;
                 case "--output":
                     outputPath = args[++i];
@@ -98,9 +105,19 @@ static class Program
         if (args.Length == 0)
         {
             Console.Error.WriteLine("Usage: ResharperProfiler.ConsoleLauncher [options] -- <executable> [args...]");
-            Console.Error.WriteLine("Options: --debug, --output <path>, --benchmark-output <path>, --product-version <ver>,");
+            Console.Error.WriteLine("Options: --debug, --debug-log <path>, --output <path>, --benchmark-output <path>, --product-version <ver>,");
             Console.Error.WriteLine("         --date <yyyy-MM-dd>, --runs <n>, --timeout <seconds>, --no-freezes, --force-focus");
             return 1;
+        }
+
+        if (_debugLogPath is not null)
+        {
+            PrepareDebugLog(_debugLogPath);
+            WriteDebugLog("Launcher debug logging enabled");
+            WriteDebugLog($"Command line: {Environment.CommandLine}");
+            WriteDebugLog($"Working directory: {Environment.CurrentDirectory}");
+            WriteDebugLog($"Process: {Environment.ProcessPath ?? "unknown"} (pid {Environment.ProcessId})");
+            WriteDebugLog($"UserInteractive={Environment.UserInteractive}, SessionId={Process.GetCurrentProcess().SessionId}");
         }
 
         var profilerDll = Path.Combine(AppContext.BaseDirectory, "ResharperProfiler.dll");
@@ -120,7 +137,7 @@ static class Program
             if (runs > 1)
                 AnsiConsole.MarkupLine($"\n[bold]═══ Run {run + 1}/{runs} ═══[/]\n");
 
-            var result = ExecuteRun(profilerDll, args, shutdownTimeoutSeconds, noFreezes, forceFocus);
+            var result = ExecuteRun(profilerDll, args, shutdownTimeoutSeconds, noFreezes, forceFocus, run);
 
             if (result is null)
                 return 1;
@@ -171,8 +188,10 @@ static class Program
         return 0;
     }
 
-    static RunResult? ExecuteRun(string profilerDll, string[] args, int shutdownTimeoutSeconds, bool noFreezes, bool forceFocus)
+    static RunResult? ExecuteRun(string profilerDll, string[] args, int shutdownTimeoutSeconds, bool noFreezes, bool forceFocus, int runIndex)
     {
+        WriteDebugLog($"Run {runIndex + 1} starting");
+
         // Reset per-run state
         _totalFreezeTime = 0;
         _maxFreezeTime = 0;
@@ -188,6 +207,7 @@ static class Program
         Servers.Clear();
 
         var pipeName = $"ResharperProfiler_{Guid.NewGuid():N}";
+        WriteDebugLog($"Run {runIndex + 1}: pipeName={pipeName}, noFreezes={noFreezes}, forceFocus={forceFocus}, target={args[0]}");
 
         // Start the pipe server (constructor blocks until the profiler connects)
         Server? server;
@@ -198,11 +218,17 @@ static class Program
         {
             try
             {
+                WriteDebugLog($"Run {runIndex + 1}: waiting for devenv profiler pipe connection");
                 server = new Server(pipeName);
                 server.MessageReceived += (ts, type, payload) => OnMessageReceived(ts, type, payload, isBackend: false);
-                server.Error += (context, ex) => Console.Error.WriteLine($"[PIPE ERROR] devenv: {context}: {ex}");
+                server.Error += (context, ex) =>
+                {
+                    WriteDebugLog($"Run {runIndex + 1}: [PIPE ERROR] devenv: {context}: {ex}");
+                    Console.Error.WriteLine($"[PIPE ERROR] devenv: {context}: {ex}");
+                };
                 server.Disconnected += () =>
                 {
+                    WriteDebugLog($"Run {runIndex + 1}: [PIPE] devenv disconnected; SolutionLoaded={SolutionLoaded.IsSet}");
                     if (_debug || !SolutionLoaded.IsSet)
                         Console.Error.WriteLine("[PIPE] devenv disconnected");
                 };
@@ -215,6 +241,7 @@ static class Program
             }
             catch (Exception ex)
             {
+                WriteDebugLog($"Run {runIndex + 1}: devenv pipe server failed: {ex}");
                 serverError = ex;
             }
             finally
@@ -241,16 +268,28 @@ static class Program
             psi.Environment["RESHARPER_PROFILER_NO_FREEZES"] = "1";
         if (forceFocus)
             psi.Environment["RESHARPER_PROFILER_FORCE_FOCUS"] = "1";
+        var profilerLogPath = GetProfilerLogPath(runIndex);
+        if (profilerLogPath is not null)
+        {
+            File.WriteAllText(profilerLogPath, string.Empty);
+            psi.Environment["RESHARPER_PROFILER_LOG_FILE"] = profilerLogPath;
+            psi.Environment["RESHARPER_PROFILER_LOG_APPEND"] = "1";
+            psi.Environment["RESHARPER_PROFILER_DEBUG_LOG"] = "1";
+            WriteDebugLog($"Run {runIndex + 1}: profiler log path={profilerLogPath}");
+        }
 
+        WriteDebugLog($"Run {runIndex + 1}: launching target");
         var process = Process.Start(psi);
 
         if (process is null)
         {
+            WriteDebugLog($"Run {runIndex + 1}: Process.Start returned null");
             Console.Error.WriteLine($"Failed to start: {args[0]}");
             return null;
         }
 
         _startupTime = Environment.TickCount64;
+        WriteDebugLog($"Run {runIndex + 1}: started process {process.Id}, SessionId={GetProcessSessionId(process)}");
 
         if (_debug)
         {
@@ -260,6 +299,7 @@ static class Program
             {
                 if (process.HasExited)
                 {
+                    WriteDebugLog($"Run {runIndex + 1}: process exited before profiler connected, exitCode={process.ExitCode}");
                     Console.Error.WriteLine($"Process exited ({process.ExitCode}) before profiler connected.");
                     return null;
                 }
@@ -267,14 +307,17 @@ static class Program
 
             if (serverError is not null)
             {
+                WriteDebugLog($"Run {runIndex + 1}: pipe server error before connect: {serverError}");
                 Console.Error.WriteLine($"Pipe server error: {serverError.Message}");
                 process.Kill();
                 return null;
             }
 
+            WriteDebugLog($"Run {runIndex + 1}: profiler connected (devenv)");
             Console.WriteLine("Profiler connected (devenv).");
 
             process.WaitForExit();
+            WriteDebugLog($"Run {runIndex + 1}: debug run process exited with code {process.ExitCode}; totalFreeze={_totalFreezeTime}, maxFreeze={_maxFreezeTime}");
             DisposeAllServers();
             return new RunResult(0, _totalFreezeTime, _maxFreezeTime, 0);
         }
@@ -294,8 +337,10 @@ static class Program
                 ctx.Status("Waiting for profiler to connect...");
                 while (!serverReady.Wait(1000))
                 {
+                    WriteDebugLog($"Run {runIndex + 1}: still waiting for profiler connection; processExited={process.HasExited}");
                     if (process.HasExited)
                     {
+                        WriteDebugLog($"Run {runIndex + 1}: process exited before profiler connected, exitCode={process.ExitCode}");
                         Console.Error.WriteLine($"Process exited ({process.ExitCode}) before profiler connected.");
                         startupOk = false;
                         return;
@@ -304,6 +349,7 @@ static class Program
 
                 if (serverError is not null)
                 {
+                    WriteDebugLog($"Run {runIndex + 1}: pipe server error before connect: {serverError}");
                     Console.Error.WriteLine($"Pipe server error: {serverError.Message}");
                     process.Kill();
                     startupOk = false;
@@ -311,6 +357,7 @@ static class Program
                 }
 
                 WriteStep("Profiler connected (devenv)", true);
+                WriteDebugLog($"Run {runIndex + 1}: profiler connected (devenv)");
 
                 ctx.Status("Waiting for solution listener...");
                 WaitForAny(SolutionListenerReady, process);
@@ -322,6 +369,7 @@ static class Program
 
                 if (!SolutionLoaded.IsSet)
                 {
+                    WriteDebugLog($"Run {runIndex + 1}: solution did not load before process exit; processExited={process.HasExited}");
                     startupOk = false;
                     return;
                 }
@@ -336,6 +384,7 @@ static class Program
                 AnsiConsole.MarkupLine(
                     $"  [dim]{totalTime / 1000.0,6:F1}s[/]  [green]✓[/] Solution loaded [dim]({totalTime / 1000.0:F1}s total)[/]\n" +
                     freezeLine);
+                WriteDebugLog($"Run {runIndex + 1}: solution loaded; totalTime={totalTime}, totalFreeze={_totalFreezeTime}, maxFreeze={_maxFreezeTime}, backendConnected={_backendConnected}, backendLateLoadTime={backendLlt}, backendDaemonSeen={_backendDaemonSeen}");
 
                 var closeStartTime = Environment.TickCount64;
                 ctx.Status("Waiting for process to exit...");
@@ -343,6 +392,7 @@ static class Program
 
                 if (!process.WaitForExit(shutdownTimeoutSeconds * 1000))
                 {
+                    WriteDebugLog($"Run {runIndex + 1}: VS did not exit within {shutdownTimeoutSeconds}s; killing");
                     AnsiConsole.MarkupLine("  [yellow]⚠[/] VS did not exit gracefully, killing...");
                     process.Kill();
                     process.WaitForExit();
@@ -350,6 +400,7 @@ static class Program
                 }
 
                 closeTime = Environment.TickCount64 - closeStartTime;
+                WriteDebugLog($"Run {runIndex + 1}: process exited; exitCode={process.ExitCode}, closeTime={closeTime}");
                 AnsiConsole.MarkupLine($"  [dim]{(Environment.TickCount64 - _startupTime) / 1000.0:F1}s[/]  [green]✓[/] Process exited in {closeTime / 1000.0,6:F1}s with code {process.ExitCode}");
             });
 
@@ -366,6 +417,7 @@ static class Program
         }
 
         DisposeAllServers();
+        WriteDebugLog($"Run {runIndex + 1}: completed; totalTime={totalTime}, totalFreeze={_totalFreezeTime}, maxFreeze={_maxFreezeTime}, closeTime={closeTime}");
         return new RunResult(totalTime, _totalFreezeTime, _maxFreezeTime, closeTime);
     }
 
@@ -375,12 +427,18 @@ static class Program
         {
             try
             {
+                WriteDebugLog("Waiting for backend profiler pipe connection");
                 var backend = new Server(pipeName);
                 _backendConnected = true;
                 backend.MessageReceived += (ts, type, payload) => OnMessageReceived(ts, type, payload, isBackend: true);
-                backend.Error += (context, ex) => Console.Error.WriteLine($"[PIPE ERROR] backend: {context}: {ex}");
+                backend.Error += (context, ex) =>
+                {
+                    WriteDebugLog($"[PIPE ERROR] backend: {context}: {ex}");
+                    Console.Error.WriteLine($"[PIPE ERROR] backend: {context}: {ex}");
+                };
                 backend.Disconnected += () =>
                 {
+                    WriteDebugLog($"[PIPE] backend disconnected; SolutionLoaded={SolutionLoaded.IsSet}");
                     if (_debug || !SolutionLoaded.IsSet)
                         Console.Error.WriteLine("[PIPE] backend disconnected");
                 };
@@ -391,10 +449,12 @@ static class Program
                     Console.WriteLine("Backend profiler connected.");
                 else
                     WriteStep("Profiler connected (backend)", true);
+                WriteDebugLog("Backend profiler connected");
             }
             catch (Exception ex)
             {
                 // Backend may never connect if OOP is not enabled - this is expected
+                WriteDebugLog($"Backend pipe server ended: {ex}");
                 if (_debug)
                     Console.WriteLine($"Backend pipe server ended: {ex.Message}");
             }
@@ -481,6 +541,66 @@ static class Program
         table.AddRow(label, $"{min}", $"{max}", $"{avg:F0}", $"{median}");
     }
 
+    static void PrepareDebugLog(string path)
+    {
+        _debugLogPathIsDirectory = Directory.Exists(path) || string.IsNullOrEmpty(Path.GetExtension(path));
+
+        if (_debugLogPathIsDirectory)
+        {
+            Directory.CreateDirectory(path);
+            _debugLogRootPath = path;
+            _debugLogPath = Path.Combine(path, "launcher.log");
+        }
+        else
+        {
+            var directory = Path.GetDirectoryName(Path.GetFullPath(path));
+            if (!string.IsNullOrEmpty(directory))
+                Directory.CreateDirectory(directory);
+
+            _debugLogPath = path;
+            _debugLogRootPath = directory ?? Environment.CurrentDirectory;
+        }
+
+        File.WriteAllText(_debugLogPath, string.Empty);
+    }
+
+    static string? GetProfilerLogPath(int runIndex)
+    {
+        if (_debugLogPath is null)
+            return null;
+
+        if (_debugLogPathIsDirectory)
+            return Path.Combine(_debugLogRootPath!, $"profiler-run-{runIndex + 1}.log");
+
+        var directory = Path.GetDirectoryName(Path.GetFullPath(_debugLogPath));
+        var fileName = Path.GetFileNameWithoutExtension(_debugLogPath);
+        var extension = Path.GetExtension(_debugLogPath);
+        return Path.Combine(directory ?? Environment.CurrentDirectory, $"{fileName}.profiler-run-{runIndex + 1}{extension}");
+    }
+
+    static void WriteDebugLog(string message)
+    {
+        if (_debugLogPath is null)
+            return;
+
+        lock (DebugLogLock)
+        {
+            File.AppendAllText(_debugLogPath, $"{DateTimeOffset.Now:O} {message}{Environment.NewLine}");
+        }
+    }
+
+    static string GetProcessSessionId(Process process)
+    {
+        try
+        {
+            return process.SessionId.ToString();
+        }
+        catch (Exception ex)
+        {
+            return $"unknown ({ex.GetType().Name}: {ex.Message})";
+        }
+    }
+
     static void WriteStep(string message, bool success)
     {
         var elapsed = (Environment.TickCount64 - _startupTime) / 1000.0;
@@ -488,6 +608,7 @@ static class Program
         var symbol = success ? "[green]✓[/]" : "[red]X[/]";
 
         AnsiConsole.MarkupLine($"  [dim]{elapsed,6:F1}s[/]  {symbol} {message}");
+        WriteDebugLog($"STEP success={success}: {message}");
     }
 
     static void WaitForAny(ManualResetEventSlim signal, Process process)
@@ -591,14 +712,18 @@ static class Program
 
     static void OnMessageReceived(long timestamp, MessageType type, byte[] payload, bool isBackend)
     {
+        WriteDebugLog($"Message received: source={(isBackend ? "backend" : "devenv")}, timestamp={timestamp}, type={type}, payloadBytes={payload.Length}");
+
         switch (type)
         {
             case MessageType.Log:
             {
+                using var reader = new BinaryReader(new MemoryStream(payload), Encoding.UTF8);
+                var message = reader.ReadString();
+                WriteDebugLog($"Profiler log ({(isBackend ? "backend" : "devenv")}): {message}");
                 if (_debug)
                 {
-                    using var reader = new BinaryReader(new MemoryStream(payload), Encoding.UTF8);
-                    Console.WriteLine($"[{timestamp}] LOG: {reader.ReadString()}");
+                    Console.WriteLine($"[{timestamp}] LOG: {message}");
                 }
 
                 break;
@@ -610,6 +735,7 @@ static class Program
                 var phase = (Phase)reader.ReadByte();
                 var success = reader.ReadBoolean();
                 var statusMessage = reader.ReadString();
+                WriteDebugLog($"Phase ({(isBackend ? "backend" : "devenv")}): {phase}, success={success}, status={statusMessage}");
                 if (_debug)
                     Console.WriteLine($"[{timestamp}] Phase: {phase} (success: {success}{(statusMessage.Length > 0 ? $", {statusMessage}" : "")})");
                 if (!success)
@@ -652,6 +778,7 @@ static class Program
             {
                 using var reader = new BinaryReader(new MemoryStream(payload));
                 var duration = reader.ReadInt64();
+                WriteDebugLog($"UIFreeze received: duration={duration}, counted={!SolutionLoaded.IsSet}, totalBefore={_totalFreezeTime}, maxBefore={_maxFreezeTime}");
 
                 if (!SolutionLoaded.IsSet)
                 {
@@ -671,6 +798,7 @@ static class Program
             {
                 using var reader = new BinaryReader(new MemoryStream(payload));
                 var latencyUs = reader.ReadInt64();
+                WriteDebugLog($"TypingLatency received: latencyUs={latencyUs}");
 
                 if (_debug)
                     Console.WriteLine($"[{timestamp}] Typing latency: {latencyUs / 1000.0:F1} ms");

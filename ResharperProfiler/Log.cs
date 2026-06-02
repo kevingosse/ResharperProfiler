@@ -5,13 +5,15 @@ namespace ResharperProfiler;
 internal static class Log
 {
     private static readonly string? LogFilePath;
+    private static readonly bool DebugEnabled;
     private static Client? _pipeClient;
 
     static Log()
     {
         LogFilePath = Environment.GetEnvironmentVariable("RESHARPER_PROFILER_LOG_FILE");
+        DebugEnabled = Environment.GetEnvironmentVariable("RESHARPER_PROFILER_DEBUG_LOG") == "1";
 
-        if (LogFilePath is not null)
+        if (LogFilePath is not null && Environment.GetEnvironmentVariable("RESHARPER_PROFILER_LOG_APPEND") != "1")
         {
             // Truncate log file
             File.WriteAllText(LogFilePath, string.Empty);
@@ -34,5 +36,11 @@ internal static class Log
         }
 
         _pipeClient?.SendLog(message);
+    }
+
+    public static void Debug(string message)
+    {
+        if (DebugEnabled)
+            Write(message);
     }
 }
